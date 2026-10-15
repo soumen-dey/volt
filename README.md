@@ -32,8 +32,8 @@ The interpreter currently supports:
   `values`, `entries`, `assign`, `fromEntries`, `hasOwn`, and `is`
 - sparse array literals and basic `Array` construction, indexed properties,
   mutable `length`, and common array methods (`push`, `pop`, `shift`,
-  `unshift`, `splice`, `slice`, `concat`, `join`, `reverse`, searches, and
-  callback methods)
+  `unshift`, `splice`, `slice`, `concat`, `join`, `reverse`, `flat`, `flatMap`,
+  searches, and callback methods)
 - selected `String`, `Number`, and `Boolean` conversions and prototype methods,
   `Math`, global numeric conversion helpers, and `JSON.parse`/`JSON.stringify`
 - `try`/`catch`/`finally`, explicit throws, and basic `Error`,

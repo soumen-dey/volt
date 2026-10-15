@@ -426,6 +426,8 @@ impl Engine {
             ("every", 1.0),
             ("find", 1.0),
             ("findIndex", 1.0),
+            ("flat", 0.0),
+            ("flatMap", 1.0),
             ("reduce", 1.1),
             ("reduceRight", 1.1),
             ("at", 1.0),
@@ -2487,6 +2489,61 @@ impl Engine {
         let values: Vec<Option<Value>> = (0..length)
             .map(|index| self.get_property(array, &index.to_string()))
             .collect();
+        if method == "flat" {
+            let depth = match arguments.first() {
+                None | Some(Value::Undefined) => 1.0,
+                Some(value) => value.to_number(),
+            };
+            let depth = if depth.is_nan() || depth <= 0.0 {
+                0
+            } else if depth.is_infinite() {
+                1000
+            } else {
+                depth.trunc().min(1000.0) as usize
+            };
+            let result = self.alloc_array();
+            let mut flattened = Vec::new();
+            for value in values.iter().flatten() {
+                self.flatten_array_value(value, depth, &mut flattened);
+            }
+            for (index, value) in flattened.iter().enumerate() {
+                self.set_property(result, &index.to_string(), value.clone());
+            }
+            return Ok(Value::Object(result));
+        }
+        if method == "flatMap" {
+            let Some(callback) = arguments.first().cloned() else {
+                return Err(EngineError::new(
+                    "TypeError",
+                    "Array callback method requires a callback",
+                    1,
+                    1,
+                ));
+            };
+            let this_arg = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+            let result = self.alloc_array();
+            let mut target = 0;
+            for (index, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    let mapped = self.call(
+                        callback.clone(),
+                        this_arg.clone(),
+                        vec![
+                            value.clone(),
+                            Value::Number(index as f64),
+                            Value::Object(array),
+                        ],
+                    )?;
+                    let mut flattened = Vec::new();
+                    self.flatten_array_value(&mapped, 1, &mut flattened);
+                    for item in flattened {
+                        self.set_property(result, &target.to_string(), item);
+                        target += 1;
+                    }
+                }
+            }
+            return Ok(Value::Object(result));
+        }
         match method {
             "push" => {
                 for (offset, value) in arguments.into_iter().enumerate() {
@@ -2832,6 +2889,22 @@ impl Engine {
             "map" | "filter" | "forEach" | "some" | "every" | "find" | "findIndex" | "reduce"
             | "reduceRight" => self.array_callback_method(method, array, values, arguments),
             _ => Ok(Value::Undefined),
+        }
+    }
+
+    fn flatten_array_value(&self, value: &Value, depth: usize, output: &mut Vec<Value>) {
+        if let Value::Object(id) = value
+            && self.objects[*id].is_array
+            && depth > 0
+        {
+            let length = self.array_length(*id);
+            for index in 0..length {
+                if let Some(item) = self.get_property(*id, &index.to_string()) {
+                    self.flatten_array_value(&item, depth - 1, output);
+                }
+            }
+        } else {
+            output.push(value.clone());
         }
     }
 
@@ -4473,6 +4546,25 @@ mod tests {
         assert_eq!(
             engine.eval_to_string("[1,,3].indexOf(undefined)").unwrap(),
             "-1"
+        );
+    }
+
+    #[test]
+    fn array_flatten_methods_handle_sparse_arrays() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string("[1,,[2,,[3]]].flat(2).join(',')")
+                .unwrap(),
+            "1,2,3"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "[1,2,3].flatMap(function(value) { return [value, value * 2]; }).join(',')"
+                )
+                .unwrap(),
+            "1,2,2,4,3,6"
         );
     }
 
