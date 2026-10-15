@@ -6,6 +6,7 @@ use parser::{BinaryOp, DeclarationKind, Expr, Stmt, UnaryOp};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 type ObjectId = usize;
@@ -120,7 +121,19 @@ enum NativeFunction {
     ObjectCreate,
     ObjectGetPrototypeOf,
     ObjectSetPrototypeOf,
+    ObjectMethod(&'static str),
     Error(&'static str),
+    Array,
+    ArrayIsArray,
+    ArrayMethod(&'static str),
+    String,
+    StringMethod(&'static str),
+    Number,
+    NumberMethod(&'static str),
+    Boolean,
+    PrimitiveMethod(&'static str),
+    Math(&'static str),
+    Json(&'static str),
 }
 
 #[derive(Clone)]
@@ -137,9 +150,11 @@ enum Function {
 #[derive(Default)]
 struct Object {
     properties: HashMap<String, Value>,
+    property_order: Vec<String>,
     parameter_map: HashMap<String, (ScopeId, String)>,
     prototype: Option<ObjectId>,
     function: Option<Function>,
+    is_array: bool,
 }
 
 enum Completion {
@@ -158,8 +173,13 @@ pub struct Engine {
     objects: Vec<Object>,
     object_prototype: ObjectId,
     global_object: ObjectId,
+    array_prototype: ObjectId,
+    string_prototype: ObjectId,
+    number_prototype: ObjectId,
+    boolean_prototype: ObjectId,
     error_prototypes: HashMap<&'static str, ObjectId>,
     strict: bool,
+    random_state: u64,
 }
 
 impl Engine {
@@ -173,11 +193,24 @@ impl Engine {
             objects: Vec::new(),
             object_prototype: 0,
             global_object: 0,
+            array_prototype: 0,
+            string_prototype: 0,
+            number_prototype: 0,
+            boolean_prototype: 0,
             error_prototypes: HashMap::new(),
             strict: false,
+            random_state: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0x9e3779b97f4a7c15)
+                .max(1),
         };
         engine.object_prototype = engine.alloc_object(None);
         engine.global_object = engine.alloc_object(Some(engine.object_prototype));
+        engine.array_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.string_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.number_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.boolean_prototype = engine.alloc_object(Some(engine.object_prototype));
         let object_constructor =
             engine.alloc_native(NativeFunction::Object, Some(engine.object_prototype));
         let create =
@@ -219,6 +252,10 @@ impl Engine {
             Value::Object(object_constructor),
         );
         engine.declare_global("Object", Value::Object(object_constructor), false);
+        engine.install_object_builtins(object_constructor);
+        engine.install_array_builtins();
+        engine.install_primitive_builtins();
+        engine.install_math_builtins();
         Self::declare_global(&mut engine, "undefined", Value::Undefined, false);
         Self::declare_global(&mut engine, "NaN", Value::Number(f64::NAN), false);
         Self::declare_global(&mut engine, "Infinity", Value::Number(f64::INFINITY), false);
@@ -251,7 +288,15 @@ impl Engine {
         self.set_property(error_base, "name", Value::String("Error".to_owned()));
         self.set_property(error_base, "message", Value::String(String::new()));
         self.error_prototypes.insert("Error", error_base);
-        for name in ["Error", "TypeError", "ReferenceError", "SyntaxError"] {
+        for name in [
+            "Error",
+            "EvalError",
+            "RangeError",
+            "ReferenceError",
+            "SyntaxError",
+            "TypeError",
+            "URIError",
+        ] {
             let constructor =
                 self.alloc_native(NativeFunction::Error(name), Some(self.object_prototype));
             let prototype = if name == "Error" {
@@ -271,6 +316,309 @@ impl Engine {
         }
     }
 
+    fn install_object_builtins(&mut self, constructor: ObjectId) {
+        for (name, native, length) in [
+            ("keys", "keys", 1.0),
+            ("getOwnPropertyNames", "getOwnPropertyNames", 1.0),
+            ("values", "values", 1.0),
+            ("entries", "entries", 1.0),
+            ("assign", "assign", 2.0),
+            ("fromEntries", "fromEntries", 1.0),
+            ("hasOwn", "hasOwn", 2.0),
+        ] {
+            let function = self.alloc_native(
+                NativeFunction::ObjectMethod(native),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(length));
+            self.set_property(constructor, name, Value::Object(function));
+        }
+        let method = self.alloc_native(
+            NativeFunction::ObjectMethod("toString"),
+            Some(self.object_prototype),
+        );
+        self.set_property(method, "name", Value::String("toString".to_owned()));
+        self.set_property(method, "length", Value::Number(0.0));
+        self.set_property(self.object_prototype, "toString", Value::Object(method));
+        for (name, arity) in [("hasOwnProperty", 1.0), ("propertyIsEnumerable", 1.0)] {
+            let method = self.alloc_native(
+                NativeFunction::ObjectMethod(name),
+                Some(self.object_prototype),
+            );
+            self.set_property(method, "name", Value::String(name.to_owned()));
+            self.set_property(method, "length", Value::Number(arity));
+            self.set_property(self.object_prototype, name, Value::Object(method));
+        }
+        let is = self.alloc_native(
+            NativeFunction::ObjectMethod("is"),
+            Some(self.object_prototype),
+        );
+        self.set_property(is, "name", Value::String("is".to_owned()));
+        self.set_property(is, "length", Value::Number(2.0));
+        self.set_property(constructor, "is", Value::Object(is));
+    }
+
+    fn install_array_builtins(&mut self) {
+        let constructor = self.alloc_native(NativeFunction::Array, Some(self.object_prototype));
+        self.set_property(constructor, "name", Value::String("Array".to_owned()));
+        self.set_property(constructor, "length", Value::Number(1.0));
+        self.set_property(
+            constructor,
+            "prototype",
+            Value::Object(self.array_prototype),
+        );
+        self.set_property(
+            self.array_prototype,
+            "constructor",
+            Value::Object(constructor),
+        );
+        let is_array = self.alloc_native(NativeFunction::ArrayIsArray, Some(self.object_prototype));
+        self.set_property(is_array, "name", Value::String("isArray".to_owned()));
+        self.set_property(is_array, "length", Value::Number(1.0));
+        self.set_property(constructor, "isArray", Value::Object(is_array));
+        for (name, arity) in [("from", 1.0), ("of", 0.0)] {
+            let function = self.alloc_native(
+                NativeFunction::ArrayMethod(name),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(arity));
+            self.set_property(constructor, name, Value::Object(function));
+        }
+        for (name, arity) in [
+            ("push", 1.0),
+            ("pop", 0.0),
+            ("shift", 0.0),
+            ("unshift", 1.0),
+            ("splice", 2.0),
+            ("join", 1.0),
+            ("toString", 0.0),
+            ("slice", 2.0),
+            ("indexOf", 1.0),
+            ("lastIndexOf", 1.0),
+            ("includes", 1.0),
+            ("reverse", 0.0),
+            ("concat", 1.0),
+            ("map", 1.0),
+            ("filter", 1.0),
+            ("forEach", 1.0),
+            ("some", 1.0),
+            ("every", 1.0),
+            ("find", 1.0),
+            ("findIndex", 1.0),
+            ("reduce", 1.1),
+            ("reduceRight", 1.1),
+            ("at", 1.0),
+            ("fill", 1.0),
+            ("copyWithin", 2.0),
+            ("sort", 1.0),
+        ] {
+            let function = self.alloc_native(
+                NativeFunction::ArrayMethod(name),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(arity));
+            self.set_property(self.array_prototype, name, Value::Object(function));
+        }
+        self.declare_global("Array", Value::Object(constructor), false);
+    }
+
+    fn install_primitive_builtins(&mut self) {
+        for (name, native, prototype) in [
+            ("String", NativeFunction::String, self.string_prototype),
+            ("Number", NativeFunction::Number, self.number_prototype),
+            ("Boolean", NativeFunction::Boolean, self.boolean_prototype),
+        ] {
+            let constructor = self.alloc_native(native, Some(self.object_prototype));
+            self.set_property(constructor, "name", Value::String(name.to_owned()));
+            self.set_property(constructor, "length", Value::Number(1.0));
+            self.set_property(constructor, "prototype", Value::Object(prototype));
+            self.set_property(prototype, "constructor", Value::Object(constructor));
+            self.declare_global(name, Value::Object(constructor), false);
+        }
+        for (name, length) in [
+            ("toString", 0.0),
+            ("valueOf", 0.0),
+            ("charAt", 1.0),
+            ("charCodeAt", 1.0),
+            ("includes", 1.0),
+            ("startsWith", 1.0),
+            ("endsWith", 1.0),
+            ("indexOf", 1.0),
+            ("slice", 2.0),
+            ("substring", 2.0),
+            ("toLowerCase", 0.0),
+            ("toUpperCase", 0.0),
+            ("trim", 0.0),
+            ("split", 2.0),
+            ("concat", 1.0),
+            ("repeat", 1.0),
+            ("padStart", 1.0),
+            ("padEnd", 1.0),
+        ] {
+            let function = self.alloc_native(
+                NativeFunction::StringMethod(name),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(length));
+            self.set_property(self.string_prototype, name, Value::Object(function));
+        }
+        for (name, arity) in [("fromCharCode", 1.0), ("fromCodePoint", 1.0)] {
+            let function = self.alloc_native(
+                NativeFunction::StringMethod(name),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(arity));
+            let constructor = self.get_global_constructor("String");
+            self.set_property(constructor, name, Value::Object(function));
+        }
+        for (name, value) in [
+            ("MAX_VALUE", f64::MAX),
+            ("MIN_VALUE", f64::MIN_POSITIVE),
+            ("NaN", f64::NAN),
+            ("POSITIVE_INFINITY", f64::INFINITY),
+            ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+            ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0),
+            ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+        ] {
+            self.set_property(
+                self.get_global_constructor("Number"),
+                name,
+                Value::Number(value),
+            );
+        }
+        for (prototype, method_name, native_name) in [
+            (self.number_prototype, "toString", "numberToString"),
+            (self.number_prototype, "valueOf", "numberValueOf"),
+            (self.boolean_prototype, "toString", "booleanToString"),
+            (self.boolean_prototype, "valueOf", "booleanValueOf"),
+        ] {
+            let function = self.alloc_native(
+                NativeFunction::PrimitiveMethod(native_name),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(method_name.to_owned()));
+            self.set_property(function, "length", Value::Number(0.0));
+            self.set_property(prototype, method_name, Value::Object(function));
+        }
+        for (name, arity) in [
+            ("isFinite", 1.0),
+            ("isInteger", 1.0),
+            ("isNaN", 1.0),
+            ("isSafeInteger", 1.0),
+            ("parseFloat", 1.0),
+            ("parseInt", 2.0),
+        ] {
+            let native = match name {
+                "parseFloat" | "parseInt" => NativeFunction::Math(name),
+                _ => NativeFunction::NumberMethod(name),
+            };
+            let function = self.alloc_native(native, Some(self.object_prototype));
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(arity));
+            let number = self.get_global_constructor("Number");
+            self.set_property(number, name, Value::Object(function));
+        }
+    }
+
+    fn install_math_builtins(&mut self) {
+        let math = self.alloc_object(Some(self.object_prototype));
+        for (name, value) in [
+            ("E", std::f64::consts::E),
+            ("LN2", std::f64::consts::LN_2),
+            ("LN10", std::f64::consts::LN_10),
+            ("LOG2E", std::f64::consts::LOG2_E),
+            ("LOG10E", std::f64::consts::LOG10_E),
+            ("PI", std::f64::consts::PI),
+            ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+            ("SQRT2", std::f64::consts::SQRT_2),
+        ] {
+            self.set_property(math, name, Value::Number(value));
+        }
+        for (name, arity) in [
+            ("abs", 1.0),
+            ("acos", 1.0),
+            ("acosh", 1.0),
+            ("ceil", 1.0),
+            ("cosh", 1.0),
+            ("floor", 1.0),
+            ("round", 1.0),
+            ("trunc", 1.0),
+            ("sqrt", 1.0),
+            ("cbrt", 1.0),
+            ("sign", 1.0),
+            ("exp", 1.0),
+            ("expm1", 1.0),
+            ("log", 1.0),
+            ("log1p", 1.0),
+            ("log2", 1.0),
+            ("log10", 1.0),
+            ("sin", 1.0),
+            ("sinh", 1.0),
+            ("cos", 1.0),
+            ("tan", 1.0),
+            ("tanh", 1.0),
+            ("asin", 1.0),
+            ("asinh", 1.0),
+            ("atanh", 1.0),
+            ("atan", 1.0),
+            ("atan2", 2.0),
+            ("pow", 2.0),
+            ("min", 2.0),
+            ("max", 2.0),
+            ("imul", 2.0),
+            ("clz32", 1.0),
+            ("fround", 1.0),
+            ("hypot", 2.0),
+            ("random", 0.0),
+        ] {
+            let function =
+                self.alloc_native(NativeFunction::Math(name), Some(self.object_prototype));
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(arity));
+            self.set_property(math, name, Value::Object(function));
+        }
+        self.declare_global("Math", Value::Object(math), false);
+        let is_nan = self.make_global_native("isNaN");
+        let is_finite = self.make_global_native("isFinite");
+        let parse_int = self.make_global_native("parseInt");
+        let parse_float = self.make_global_native("parseFloat");
+        self.declare_global("isNaN", is_nan, true);
+        self.declare_global("isFinite", is_finite, true);
+        self.declare_global("parseInt", parse_int, true);
+        self.declare_global("parseFloat", parse_float, true);
+        let json = self.alloc_object(Some(self.object_prototype));
+        for (name, arity) in [("stringify", 3.0), ("parse", 2.0)] {
+            let function =
+                self.alloc_native(NativeFunction::Json(name), Some(self.object_prototype));
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(arity));
+            self.set_property(json, name, Value::Object(function));
+        }
+        self.declare_global("JSON", Value::Object(json), false);
+    }
+
+    fn get_global_constructor(&self, name: &str) -> ObjectId {
+        match self.scopes[self.global]
+            .bindings
+            .get(name)
+            .map(|binding| &binding.value)
+        {
+            Some(Value::Object(id)) => *id,
+            _ => unreachable!("built-in constructor installed before its constants"),
+        }
+    }
+
+    fn make_global_native(&mut self, name: &'static str) -> Value {
+        let function = self.alloc_native(NativeFunction::Math(name), Some(self.object_prototype));
+        self.set_property(function, "name", Value::String(name.to_owned()));
+        Value::Object(function)
+    }
+
     fn alloc_object(&mut self, prototype: Option<ObjectId>) -> ObjectId {
         let id = self.objects.len();
         self.objects.push(Object {
@@ -278,6 +626,15 @@ impl Engine {
             ..Object::default()
         });
         id
+    }
+
+    fn alloc_array(&mut self) -> ObjectId {
+        let array = self.alloc_object(Some(self.array_prototype));
+        self.objects[array].is_array = true;
+        self.objects[array]
+            .properties
+            .insert("length".to_owned(), Value::Number(0.0));
+        array
     }
 
     fn alloc_native(&mut self, native: NativeFunction, prototype: Option<ObjectId>) -> ObjectId {
@@ -544,6 +901,10 @@ impl Engine {
     }
 
     fn to_string(&self, value: &Value) -> String {
+        self.to_string_inner(value, &mut HashSet::new())
+    }
+
+    fn to_string_inner(&self, value: &Value, ancestors: &mut HashSet<ObjectId>) -> String {
         match value {
             Value::Object(id) => {
                 if let Some(function) = &self.objects[*id].function {
@@ -567,12 +928,34 @@ impl Engine {
                     } else {
                         format!("{name}: {message}")
                     }
+                } else if self.objects[*id].is_array {
+                    if !ancestors.insert(*id) {
+                        return String::new();
+                    }
+                    let result = self.array_join_string(*id, ",", ancestors);
+                    ancestors.remove(id);
+                    result
                 } else {
                     "[object Object]".to_owned()
                 }
             }
             _ => value.to_js_string(),
         }
+    }
+
+    fn array_join_string(
+        &self,
+        array: ObjectId,
+        separator: &str,
+        ancestors: &mut HashSet<ObjectId>,
+    ) -> String {
+        (0..self.array_length(array))
+            .map(|index| match self.get_property(array, &index.to_string()) {
+                None | Some(Value::Undefined | Value::Null) => String::new(),
+                Some(value) => self.to_string_inner(&value, ancestors),
+            })
+            .collect::<Vec<_>>()
+            .join(separator)
     }
 
     fn execute_statements(
@@ -994,6 +1377,17 @@ impl Engine {
                 }
                 Ok(Value::Object(object))
             }
+            Expr::Array(elements) => {
+                let array = self.alloc_array();
+                for (index, element) in elements.iter().enumerate() {
+                    if let Some(element) = element {
+                        let value = self.evaluate(element, scope)?;
+                        self.set_property(array, &index.to_string(), value);
+                    }
+                }
+                self.set_property(array, "length", Value::Number(elements.len() as f64));
+                Ok(Value::Object(array))
+            }
             Expr::Member(object, property) => {
                 let object = self.evaluate(object, scope)?;
                 self.get_property_value(object, property, 1, 1)
@@ -1191,8 +1585,12 @@ impl Engine {
                 match object {
                     Value::Object(id) => {
                         self.objects[id].parameter_map.remove(property);
-                        self.objects[id].properties.remove(property);
-                        Ok(Value::Boolean(true))
+                        if self.objects[id].is_array && property == "length" {
+                            Ok(Value::Boolean(false))
+                        } else {
+                            self.remove_property(id, property);
+                            Ok(Value::Boolean(true))
+                        }
                     }
                     Value::Null | Value::Undefined => Err(EngineError::new(
                         "TypeError",
@@ -1209,8 +1607,12 @@ impl Engine {
                 match object {
                     Value::Object(id) => {
                         self.objects[id].parameter_map.remove(&property);
-                        self.objects[id].properties.remove(&property);
-                        Ok(Value::Boolean(true))
+                        if self.objects[id].is_array && property == "length" {
+                            Ok(Value::Boolean(false))
+                        } else {
+                            self.remove_property(id, &property);
+                            Ok(Value::Boolean(true))
+                        }
                     }
                     Value::Null | Value::Undefined => Err(EngineError::new(
                         "TypeError",
@@ -1265,9 +1667,37 @@ impl Engine {
         {
             binding.value = value.clone();
         }
+        if !self.objects[object]
+            .property_order
+            .iter()
+            .any(|property| property == name)
+        {
+            self.objects[object].property_order.push(name.to_owned());
+        }
         self.objects[object]
             .properties
             .insert(name.to_owned(), value);
+        if self.objects[object].is_array
+            && let Some(index) = array_index(name)
+        {
+            let length = self.objects[object]
+                .properties
+                .get("length")
+                .map(Value::to_number)
+                .unwrap_or(0.0);
+            if f64::from(index) >= length {
+                self.objects[object]
+                    .properties
+                    .insert("length".to_owned(), Value::Number(f64::from(index) + 1.0));
+            }
+        }
+    }
+
+    fn remove_property(&mut self, object: ObjectId, name: &str) {
+        self.objects[object].properties.remove(name);
+        self.objects[object]
+            .property_order
+            .retain(|property| property != name);
     }
 
     fn get_own_property(&self, object: ObjectId, name: &str) -> Option<Value> {
@@ -1318,7 +1748,12 @@ impl Engine {
             &self.objects[object].function,
             Some(Function::User { .. })
                 | Some(Function::Native(
-                    NativeFunction::Object | NativeFunction::Error(_)
+                    NativeFunction::Object
+                        | NativeFunction::Error(_)
+                        | NativeFunction::Array
+                        | NativeFunction::String
+                        | NativeFunction::Number
+                        | NativeFunction::Boolean
                 ))
         )
     }
@@ -1338,7 +1773,20 @@ impl Engine {
                 line,
                 column,
             )),
-            _ => Ok(Value::Undefined),
+            Value::String(value) if name == "length" => {
+                Ok(Value::Number(value.encode_utf16().count() as f64))
+            }
+            Value::String(value) => Ok(array_index(name)
+                .and_then(|index| value.chars().nth(index as usize))
+                .map(|character| Value::String(character.to_string()))
+                .or_else(|| self.get_property(self.string_prototype, name))
+                .unwrap_or(Value::Undefined)),
+            Value::Number(_) => Ok(self
+                .get_property(self.number_prototype, name)
+                .unwrap_or(Value::Undefined)),
+            Value::Boolean(_) => Ok(self
+                .get_property(self.boolean_prototype, name)
+                .unwrap_or(Value::Undefined)),
         }
     }
 
@@ -1351,7 +1799,36 @@ impl Engine {
         column: usize,
     ) -> Result<(), EngineError> {
         if let Value::Object(id) = value {
-            self.set_property(id, name, property);
+            if self.objects[id].is_array && name == "length" {
+                let length = property.to_number();
+                if !length.is_finite()
+                    || length < 0.0
+                    || length.fract() != 0.0
+                    || length > u32::MAX as f64
+                {
+                    return Err(EngineError::new(
+                        "RangeError",
+                        "Invalid array length",
+                        line,
+                        column,
+                    ));
+                }
+                let length = length as u32;
+                let keys: Vec<String> = self.objects[id]
+                    .properties
+                    .keys()
+                    .filter(|key| array_index(key).is_some_and(|index| index >= length))
+                    .cloned()
+                    .collect();
+                for key in keys {
+                    self.objects[id].properties.remove(&key);
+                }
+                self.objects[id]
+                    .properties
+                    .insert(name.to_owned(), Value::Number(length as f64));
+            } else {
+                self.set_property(id, name, property);
+            }
             Ok(())
         } else {
             Err(EngineError::new(
@@ -1457,13 +1934,14 @@ impl Engine {
                     )),
                 }
             }
-            Function::Native(native) => self.call_native(native, arguments),
+            Function::Native(native) => self.call_native(native, this_value, arguments),
         }
     }
 
     fn call_native(
         &mut self,
         native: NativeFunction,
+        this_value: Value,
         arguments: Vec<Value>,
     ) -> Result<Value, EngineError> {
         match native {
@@ -1475,6 +1953,118 @@ impl Engine {
                 Some(_) => Ok(Value::Object(
                     self.alloc_object(Some(self.object_prototype)),
                 )),
+            },
+            NativeFunction::Array => {
+                let array = self.alloc_array();
+                if let [Value::Number(length)] = arguments.as_slice() {
+                    if !length.is_finite()
+                        || *length < 0.0
+                        || length.fract() != 0.0
+                        || *length > u32::MAX as f64
+                    {
+                        return Err(EngineError::new("RangeError", "Invalid array length", 1, 1));
+                    }
+                    self.set_property(array, "length", Value::Number(*length));
+                } else {
+                    for (index, value) in arguments.into_iter().enumerate() {
+                        self.set_property(array, &index.to_string(), value);
+                    }
+                }
+                Ok(Value::Object(array))
+            }
+            NativeFunction::ArrayIsArray => Ok(Value::Boolean(matches!(
+                arguments.first(),
+                Some(Value::Object(id)) if self.objects[*id].is_array
+            ))),
+            NativeFunction::ArrayMethod(method) => {
+                self.call_array_method(method, this_value, arguments)
+            }
+            NativeFunction::String => Ok(Value::String(
+                arguments
+                    .first()
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_default(),
+            )),
+            NativeFunction::Number => Ok(Value::Number(
+                arguments.first().map(Value::to_number).unwrap_or(0.0),
+            )),
+            NativeFunction::NumberMethod(method) => {
+                let value = arguments.first();
+                let result = match method {
+                    "isNaN" => matches!(value, Some(Value::Number(value)) if value.is_nan()),
+                    "isFinite" => matches!(value, Some(Value::Number(value)) if value.is_finite()),
+                    "isInteger" => {
+                        matches!(value, Some(Value::Number(value)) if value.is_finite() && value.fract() == 0.0)
+                    }
+                    "isSafeInteger" => matches!(
+                        value,
+                        Some(Value::Number(value))
+                            if value.is_finite()
+                                && value.fract() == 0.0
+                                && value.abs() <= 9_007_199_254_740_991.0
+                    ),
+                    "parseFloat" | "parseInt" => {
+                        return self.call_math(method, arguments);
+                    }
+                    _ => false,
+                };
+                Ok(Value::Boolean(result))
+            }
+            NativeFunction::Boolean => Ok(Value::Boolean(
+                arguments.first().is_some_and(Value::is_truthy),
+            )),
+            NativeFunction::PrimitiveMethod(method) => match (method, this_value) {
+                ("numberToString", Value::Number(value)) => {
+                    if let Some(Value::Number(radix)) = arguments.first() {
+                        let radix = *radix as u32;
+                        if !(2..=36).contains(&radix) {
+                            return Err(EngineError::new(
+                                "RangeError",
+                                "Radix must be between 2 and 36",
+                                1,
+                                1,
+                            ));
+                        }
+                        Ok(Value::String(format_radix(value, radix)))
+                    } else {
+                        Ok(Value::String(Value::Number(value).to_js_string()))
+                    }
+                }
+                ("numberValueOf", value @ Value::Number(_)) => Ok(value),
+                ("booleanToString", Value::Boolean(value)) => Ok(Value::String(value.to_string())),
+                ("booleanValueOf", value @ Value::Boolean(_)) => Ok(value),
+                _ => Err(EngineError::new(
+                    "TypeError",
+                    "Incompatible primitive receiver",
+                    1,
+                    1,
+                )),
+            },
+            NativeFunction::StringMethod(method) => {
+                self.call_string_method(method, this_value, arguments)
+            }
+            NativeFunction::ObjectMethod(method) => {
+                self.call_object_method(method, this_value, arguments)
+            }
+            NativeFunction::Math(method) => self.call_math(method, arguments),
+            NativeFunction::Json(method) => match method {
+                "stringify" => match arguments.first() {
+                    None | Some(Value::Undefined) => Ok(Value::Undefined),
+                    Some(value) => self
+                        .json_stringify(value, &mut HashSet::new())?
+                        .map(Value::String)
+                        .map(Ok)
+                        .unwrap_or(Ok(Value::Undefined)),
+                },
+                "parse" => {
+                    let input = arguments
+                        .first()
+                        .map(|value| self.to_string(value))
+                        .unwrap_or_else(|| "undefined".to_owned());
+                    let mut parser = JsonParser::new(&input);
+                    parser.parse_value(self)
+                }
+                _ => Ok(Value::Undefined),
             },
             NativeFunction::ObjectCreate => {
                 let prototype = match arguments.first().unwrap_or(&Value::Undefined) {
@@ -1563,6 +2153,1170 @@ impl Engine {
         }
     }
 
+    fn call_array_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        if method == "of" {
+            let array = self.alloc_array();
+            for (index, value) in arguments.into_iter().enumerate() {
+                self.set_property(array, &index.to_string(), value);
+            }
+            return Ok(Value::Object(array));
+        }
+        if method == "from" {
+            let mut values = match arguments.first() {
+                Some(Value::Object(id)) if self.objects[*id].is_array => {
+                    let length = self.array_length(*id);
+                    (0..length)
+                        .map(|index| self.get_property(*id, &index.to_string()))
+                        .collect()
+                }
+                Some(Value::String(value)) => value
+                    .chars()
+                    .map(|character| Some(Value::String(character.to_string())))
+                    .collect(),
+                Some(Value::Null | Value::Undefined) | None => {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Array.from requires an array-like value",
+                        1,
+                        1,
+                    ));
+                }
+                Some(Value::Object(id)) => {
+                    let length = self
+                        .get_property(*id, "length")
+                        .map(|value| value.to_number())
+                        .unwrap_or(0.0);
+                    let length = if !length.is_finite() || length <= 0.0 {
+                        0
+                    } else {
+                        length.ceil().min(u32::MAX as f64) as usize
+                    };
+                    (0..length)
+                        .map(|index| self.get_property(*id, &index.to_string()))
+                        .collect()
+                }
+                Some(_) => Vec::new(),
+            };
+            if let Some(mapper) = arguments.get(1) {
+                for (index, value) in values.iter_mut().enumerate() {
+                    let input = value.clone().unwrap_or(Value::Undefined);
+                    *value = Some(self.call(
+                        mapper.clone(),
+                        arguments.get(2).cloned().unwrap_or(Value::Undefined),
+                        vec![input, Value::Number(index as f64)],
+                    )?);
+                }
+            }
+            let source_length = values.len();
+            let array = self.alloc_array();
+            for (index, value) in values.into_iter().enumerate() {
+                if let Some(value) = value {
+                    self.set_property(array, &index.to_string(), value);
+                }
+            }
+            self.objects[array]
+                .properties
+                .insert("length".to_owned(), Value::Number(source_length as f64));
+            return Ok(Value::Object(array));
+        }
+
+        let Value::Object(array) = this_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Array method called on a non-object",
+                1,
+                1,
+            ));
+        };
+        if !self.objects[array].is_array {
+            return Err(EngineError::new(
+                "TypeError",
+                "Array method called on a non-array",
+                1,
+                1,
+            ));
+        }
+        let length = self.array_length(array);
+        let values: Vec<Option<Value>> = (0..length)
+            .map(|index| self.get_property(array, &index.to_string()))
+            .collect();
+        match method {
+            "push" => {
+                for (offset, value) in arguments.into_iter().enumerate() {
+                    self.set_property(array, &(length + offset).to_string(), value);
+                }
+                Ok(Value::Number(self.array_length(array) as f64))
+            }
+            "pop" => {
+                if length == 0 {
+                    return Ok(Value::Undefined);
+                }
+                let last = (length - 1).to_string();
+                let value = self.get_property(array, &last).unwrap_or(Value::Undefined);
+                self.objects[array].properties.remove(&last);
+                self.objects[array]
+                    .properties
+                    .insert("length".to_owned(), Value::Number((length - 1) as f64));
+                Ok(value)
+            }
+            "shift" => {
+                if length == 0 {
+                    return Ok(Value::Undefined);
+                }
+                let first = values[0].clone().unwrap_or(Value::Undefined);
+                for (index, value) in values.iter().enumerate().skip(1) {
+                    let from = index.to_string();
+                    let to = (index - 1).to_string();
+                    match value.clone() {
+                        Some(value) => self.objects[array].properties.insert(to, value),
+                        None => self.objects[array].properties.remove(&to),
+                    };
+                    self.objects[array].properties.remove(&from);
+                }
+                self.objects[array]
+                    .properties
+                    .insert("length".to_owned(), Value::Number((length - 1) as f64));
+                Ok(first)
+            }
+            "unshift" => {
+                let count = arguments.len();
+                for index in (0..length).rev() {
+                    let to = (index + count).to_string();
+                    match values[index].clone() {
+                        Some(value) => self.objects[array].properties.insert(to, value),
+                        None => self.objects[array].properties.remove(&to),
+                    };
+                }
+                for (index, value) in arguments.into_iter().enumerate() {
+                    self.objects[array]
+                        .properties
+                        .insert(index.to_string(), value);
+                }
+                let new_length = length + count;
+                self.objects[array]
+                    .properties
+                    .insert("length".to_owned(), Value::Number(new_length as f64));
+                Ok(Value::Number(new_length as f64))
+            }
+            "splice" => {
+                let start = normalize_slice_index(
+                    arguments.first().map(Value::to_number).unwrap_or(0.0),
+                    length,
+                );
+                let delete_count = arguments
+                    .get(1)
+                    .map(Value::to_number)
+                    .map(|value| {
+                        if value.is_nan() || value <= 0.0 {
+                            0
+                        } else {
+                            (value.trunc() as usize).min(length - start)
+                        }
+                    })
+                    .unwrap_or(length - start);
+                let removed = self.alloc_array();
+                for index in 0..delete_count {
+                    if let Some(value) = values[start + index].clone() {
+                        self.set_property(removed, &index.to_string(), value);
+                    }
+                }
+                self.objects[removed]
+                    .properties
+                    .insert("length".to_owned(), Value::Number(delete_count as f64));
+                let mut updated =
+                    Vec::with_capacity(length - delete_count + arguments.len().saturating_sub(2));
+                updated.extend(values[..start].iter().cloned());
+                updated.extend(arguments.iter().skip(2).cloned().map(Some));
+                updated.extend(values[start + delete_count..].iter().cloned());
+                let old_indices: Vec<String> = self.objects[array]
+                    .properties
+                    .keys()
+                    .filter(|name| array_index(name).is_some())
+                    .cloned()
+                    .collect();
+                for name in old_indices {
+                    self.objects[array].properties.remove(&name);
+                }
+                for (index, value) in updated.iter().enumerate() {
+                    if let Some(value) = value {
+                        self.set_property(array, &index.to_string(), value.clone());
+                    }
+                }
+                self.objects[array]
+                    .properties
+                    .insert("length".to_owned(), Value::Number(updated.len() as f64));
+                Ok(Value::Object(removed))
+            }
+            "join" | "toString" => {
+                let separator = arguments
+                    .first()
+                    .filter(|value| !matches!(value, Value::Undefined))
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_else(|| ",".to_owned());
+                let mut ancestors = HashSet::new();
+                ancestors.insert(array);
+                Ok(Value::String(self.array_join_string(
+                    array,
+                    &separator,
+                    &mut ancestors,
+                )))
+            }
+            "slice" => {
+                let start = normalize_slice_index(
+                    arguments.first().map(Value::to_number).unwrap_or(0.0),
+                    length,
+                );
+                let end = normalize_slice_index(
+                    arguments
+                        .get(1)
+                        .map(Value::to_number)
+                        .unwrap_or(length as f64),
+                    length,
+                )
+                .max(start);
+                let result = self.alloc_array();
+                for (target, source) in (start..end).enumerate() {
+                    if let Some(value) = values[source].clone() {
+                        self.set_property(result, &target.to_string(), value);
+                    }
+                }
+                self.objects[result]
+                    .properties
+                    .insert("length".to_owned(), Value::Number((end - start) as f64));
+                Ok(Value::Object(result))
+            }
+            "indexOf" | "lastIndexOf" | "includes" => {
+                let search = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let start = if method == "lastIndexOf" {
+                    match arguments.get(1).map(Value::to_number) {
+                        None => length.saturating_sub(1),
+                        Some(value) if value.is_nan() => length.saturating_sub(1),
+                        Some(value) if value < 0.0 => {
+                            let index = length as isize + value.trunc() as isize;
+                            if index < 0 {
+                                return Ok(Value::Number(-1.0));
+                            }
+                            index as usize
+                        }
+                        Some(value) => (value.trunc() as usize).min(length.saturating_sub(1)),
+                    }
+                } else {
+                    normalize_relative_start(
+                        arguments.get(1).map(Value::to_number).unwrap_or(0.0),
+                        length,
+                    )
+                };
+                if length == 0 {
+                    return Ok(if method == "includes" {
+                        Value::Boolean(false)
+                    } else {
+                        Value::Number(-1.0)
+                    });
+                }
+                let mut indices: Box<dyn Iterator<Item = usize>> = if method == "lastIndexOf" {
+                    Box::new((0..=start.min(length.saturating_sub(1))).rev())
+                } else {
+                    Box::new(start..length)
+                };
+                let found = indices.find(|index| {
+                    let current = values[*index].as_ref().unwrap_or(&Value::Undefined);
+                    if method == "includes" {
+                        same_value_zero(current, &search)
+                    } else {
+                        values[*index]
+                            .as_ref()
+                            .is_some_and(|current| self.strict_equal(current, &search))
+                    }
+                });
+                Ok(if method == "includes" {
+                    Value::Boolean(found.is_some())
+                } else {
+                    Value::Number(found.map(|index| index as f64).unwrap_or(-1.0))
+                })
+            }
+            "reverse" => {
+                for index in 0..length / 2 {
+                    let opposite = length - 1 - index;
+                    for (to, from) in [(index, opposite), (opposite, index)] {
+                        let key = to.to_string();
+                        match values[from].clone() {
+                            Some(value) => {
+                                self.objects[array].properties.insert(key, value);
+                            }
+                            None => {
+                                self.objects[array].properties.remove(&key);
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Object(array))
+            }
+            "concat" => {
+                let result = self.alloc_array();
+                let mut target = 0;
+                for value in std::iter::once(Value::Object(array)).chain(arguments) {
+                    if let Value::Object(id) = value
+                        && self.objects[id].is_array
+                    {
+                        let count = self.array_length(id);
+                        for index in 0..count {
+                            if let Some(value) = self.get_property(id, &index.to_string()) {
+                                self.set_property(result, &target.to_string(), value);
+                            }
+                            target += 1;
+                        }
+                    } else {
+                        self.set_property(result, &target.to_string(), value);
+                        target += 1;
+                    }
+                }
+                self.objects[result]
+                    .properties
+                    .insert("length".to_owned(), Value::Number(target as f64));
+                Ok(Value::Object(result))
+            }
+            "at" => {
+                let index = normalize_relative_index(
+                    arguments.first().map(Value::to_number).unwrap_or(f64::NAN),
+                    length,
+                );
+                Ok(index
+                    .and_then(|index| values[index].clone())
+                    .unwrap_or(Value::Undefined))
+            }
+            "fill" => {
+                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let start = normalize_index(
+                    arguments.get(1).map(Value::to_number).unwrap_or(0.0),
+                    length,
+                );
+                let end = normalize_index(
+                    arguments
+                        .get(2)
+                        .map(Value::to_number)
+                        .unwrap_or(length as f64),
+                    length,
+                );
+                for index in start..end {
+                    self.set_property(array, &index.to_string(), value.clone());
+                }
+                Ok(Value::Object(array))
+            }
+            "copyWithin" => {
+                let target = normalize_relative_start(
+                    arguments.first().map(Value::to_number).unwrap_or(0.0),
+                    length,
+                );
+                let start = normalize_relative_start(
+                    arguments.get(1).map(Value::to_number).unwrap_or(0.0),
+                    length,
+                );
+                let end = normalize_relative_start(
+                    arguments
+                        .get(2)
+                        .map(Value::to_number)
+                        .unwrap_or(length as f64),
+                    length,
+                );
+                let count = end.saturating_sub(start).min(length - target);
+                let copied = values[start..start + count].to_vec();
+                for (offset, value) in copied.into_iter().enumerate() {
+                    let key = (target + offset).to_string();
+                    match value {
+                        Some(value) => self.set_property(array, &key, value),
+                        None => {
+                            self.objects[array].properties.remove(&key);
+                        }
+                    }
+                }
+                Ok(Value::Object(array))
+            }
+            "sort" => {
+                let comparator = arguments.first().cloned();
+                let mut defined = Vec::new();
+                let mut undefined_count = 0;
+                for value in values.iter().flatten() {
+                    if matches!(value, Value::Undefined) {
+                        undefined_count += 1;
+                    } else {
+                        defined.push(value.clone());
+                    }
+                }
+                for index in 1..defined.len() {
+                    let mut position = index;
+                    while position > 0 {
+                        let ordering = if let Some(comparator) = &comparator {
+                            let compared = self.call(
+                                comparator.clone(),
+                                Value::Undefined,
+                                vec![defined[position - 1].clone(), defined[position].clone()],
+                            )?;
+                            let number = compared.to_number();
+                            if number.is_nan() || number == 0.0 {
+                                std::cmp::Ordering::Equal
+                            } else if number < 0.0 {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            }
+                        } else {
+                            self.to_string(&defined[position - 1])
+                                .cmp(&self.to_string(&defined[position]))
+                        };
+                        if ordering != std::cmp::Ordering::Greater {
+                            break;
+                        }
+                        defined.swap(position - 1, position);
+                        position -= 1;
+                    }
+                }
+                let mut sorted = defined;
+                sorted.extend(std::iter::repeat_n(Value::Undefined, undefined_count));
+                for index in 0..length {
+                    let key = index.to_string();
+                    if let Some(value) = sorted.get(index) {
+                        self.set_property(array, &key, value.clone());
+                    } else {
+                        self.objects[array].properties.remove(&key);
+                    }
+                }
+                Ok(Value::Object(array))
+            }
+            "map" | "filter" | "forEach" | "some" | "every" | "find" | "findIndex" | "reduce"
+            | "reduceRight" => self.array_callback_method(method, array, values, arguments),
+            _ => Ok(Value::Undefined),
+        }
+    }
+
+    fn array_callback_method(
+        &mut self,
+        method: &str,
+        array: ObjectId,
+        values: Vec<Option<Value>>,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        let Some(callback) = arguments.first().cloned() else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Array callback method requires a callback",
+                1,
+                1,
+            ));
+        };
+        let this_arg = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+        let result = if method == "map" || method == "filter" {
+            Some(self.alloc_array())
+        } else {
+            None
+        };
+        let mut output_index = 0;
+        let is_reduce = method == "reduce" || method == "reduceRight";
+        let mut accumulator = arguments.get(1).cloned();
+        let mut started = !is_reduce || accumulator.is_some();
+        let indices: Box<dyn Iterator<Item = (usize, &Option<Value>)>> = if method == "reduceRight"
+        {
+            Box::new(values.iter().enumerate().rev())
+        } else {
+            Box::new(values.iter().enumerate())
+        };
+        for (index, entry) in indices {
+            let value = match entry {
+                Some(value) => value.clone(),
+                None if method == "find" || method == "findIndex" => Value::Undefined,
+                None => continue,
+            };
+            if is_reduce && !started {
+                accumulator = Some(value);
+                started = true;
+                continue;
+            }
+            let callback_this = if is_reduce {
+                Value::Undefined
+            } else {
+                this_arg.clone()
+            };
+            let callback_args = if is_reduce {
+                vec![
+                    accumulator.clone().unwrap_or(Value::Undefined),
+                    value.clone(),
+                    Value::Number(index as f64),
+                    Value::Object(array),
+                ]
+            } else {
+                vec![
+                    value.clone(),
+                    Value::Number(index as f64),
+                    Value::Object(array),
+                ]
+            };
+            let callback_result = self.call(callback.clone(), callback_this, callback_args)?;
+            match method {
+                "map" => {
+                    self.set_property(
+                        result.expect("map result exists"),
+                        &index.to_string(),
+                        callback_result,
+                    );
+                }
+                "filter" if callback_result.is_truthy() => {
+                    self.set_property(
+                        result.expect("filter result exists"),
+                        &output_index.to_string(),
+                        value,
+                    );
+                    output_index += 1;
+                }
+                "some" if callback_result.is_truthy() => {
+                    return Ok(Value::Boolean(true));
+                }
+                "every" if !callback_result.is_truthy() => {
+                    return Ok(Value::Boolean(false));
+                }
+                "find" if callback_result.is_truthy() => return Ok(value),
+                "findIndex" if callback_result.is_truthy() => {
+                    return Ok(Value::Number(index as f64));
+                }
+                "reduce" | "reduceRight" => accumulator = Some(callback_result),
+                _ => {}
+            }
+        }
+        match method {
+            "map" => {
+                let result = result.expect("map result exists");
+                self.objects[result]
+                    .properties
+                    .insert("length".to_owned(), Value::Number(values.len() as f64));
+                Ok(Value::Object(result))
+            }
+            "filter" => Ok(Value::Object(result.expect("filter result exists"))),
+            "forEach" => Ok(Value::Undefined),
+            "some" => Ok(Value::Boolean(false)),
+            "every" => Ok(Value::Boolean(true)),
+            "find" => Ok(Value::Undefined),
+            "findIndex" => Ok(Value::Number(-1.0)),
+            "reduce" | "reduceRight" if !started => Err(EngineError::new(
+                "TypeError",
+                "Reduce of empty array with no initial value",
+                1,
+                1,
+            )),
+            "reduce" | "reduceRight" => Ok(accumulator.unwrap_or(Value::Undefined)),
+            _ => unreachable!("only callback array methods reach this function"),
+        }
+    }
+
+    fn array_length(&self, array: ObjectId) -> usize {
+        self.objects[array]
+            .properties
+            .get("length")
+            .map(Value::to_number)
+            .unwrap_or(0.0) as usize
+    }
+
+    fn call_string_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        if method == "fromCharCode" {
+            let units: Vec<u16> = arguments
+                .iter()
+                .map(|value| value.to_number() as u16)
+                .collect();
+            return Ok(Value::String(
+                std::char::decode_utf16(units)
+                    .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect(),
+            ));
+        }
+        if method == "fromCodePoint" {
+            let mut output = String::new();
+            for value in arguments {
+                let number = value.to_number();
+                if !number.is_finite()
+                    || number.fract() != 0.0
+                    || !(0.0..=0x10ffff as f64).contains(&number)
+                    || (0xd800..=0xdfff).contains(&(number as u32))
+                {
+                    return Err(EngineError::new("RangeError", "Invalid code point", 1, 1));
+                }
+                output.push(char::from_u32(number as u32).expect("validated Unicode scalar"));
+            }
+            return Ok(Value::String(output));
+        }
+        let string = match this_value {
+            Value::Null | Value::Undefined => {
+                return Err(EngineError::new(
+                    "TypeError",
+                    "String method called on null or undefined",
+                    1,
+                    1,
+                ));
+            }
+            value => self.to_string(&value),
+        };
+        let chars: Vec<char> = string.chars().collect();
+        let result = match method {
+            "toString" | "valueOf" => return Ok(Value::String(string)),
+            "toLowerCase" => string.to_lowercase(),
+            "toUpperCase" => string.to_uppercase(),
+            "trim" => string.trim().to_owned(),
+            "concat" => {
+                let mut result = string;
+                for value in arguments {
+                    result.push_str(&self.to_string(&value));
+                }
+                return Ok(Value::String(result));
+            }
+            "repeat" => {
+                let count = arguments.first().map(Value::to_number).unwrap_or(0.0);
+                if !count.is_finite() || count < 0.0 {
+                    return Err(EngineError::new("RangeError", "Invalid repeat count", 1, 1));
+                }
+                return Ok(Value::String(
+                    string.repeat((count as usize).min(1_000_000)),
+                ));
+            }
+            "padStart" | "padEnd" => {
+                let target = arguments.first().map(Value::to_number).unwrap_or(0.0);
+                let target = if target.is_finite() && target > 0.0 {
+                    (target as usize).min(1_000_000)
+                } else {
+                    0
+                };
+                let current_length = string.encode_utf16().count();
+                if target <= current_length {
+                    return Ok(Value::String(string));
+                }
+                let filler = arguments
+                    .get(1)
+                    .filter(|value| !matches!(value, Value::Undefined))
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_else(|| " ".to_owned());
+                if filler.is_empty() {
+                    return Ok(Value::String(string));
+                }
+                let padding_length = target - current_length;
+                let padding: String = filler.chars().cycle().take(padding_length).collect();
+                return Ok(Value::String(if method == "padStart" {
+                    format!("{padding}{string}")
+                } else {
+                    format!("{string}{padding}")
+                }));
+            }
+            "charAt" => chars
+                .get(normalize_index(
+                    arguments.first().map(Value::to_number).unwrap_or(0.0),
+                    chars.len(),
+                ))
+                .map(char::to_string)
+                .unwrap_or_default(),
+            "charCodeAt" => {
+                let index = normalize_index(
+                    arguments.first().map(Value::to_number).unwrap_or(0.0),
+                    chars.len(),
+                );
+                return Ok(chars
+                    .get(index)
+                    .map(|character| Value::Number(*character as u32 as f64))
+                    .unwrap_or(Value::Number(f64::NAN)));
+            }
+            "includes" | "startsWith" | "endsWith" => {
+                let search = arguments
+                    .first()
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_else(|| "undefined".to_owned());
+                return Ok(Value::Boolean(match method {
+                    "includes" => string.contains(&search),
+                    "startsWith" => string.starts_with(&search),
+                    _ => string.ends_with(&search),
+                }));
+            }
+            "indexOf" => {
+                let search = arguments
+                    .first()
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_else(|| "undefined".to_owned());
+                let start = normalize_index(
+                    arguments.get(1).map(Value::to_number).unwrap_or(0.0),
+                    chars.len(),
+                );
+                let tail: String = chars[start..].iter().collect();
+                return Ok(Value::Number(
+                    tail.find(&search)
+                        .map(|byte_offset| (start + tail[..byte_offset].chars().count()) as f64)
+                        .unwrap_or(-1.0),
+                ));
+            }
+            "slice" | "substring" => {
+                let mut start = if method == "slice" {
+                    normalize_slice_index(
+                        arguments.first().map(Value::to_number).unwrap_or(0.0),
+                        chars.len(),
+                    )
+                } else {
+                    normalize_index(
+                        arguments.first().map(Value::to_number).unwrap_or(0.0),
+                        chars.len(),
+                    )
+                };
+                let mut end = if method == "slice" {
+                    normalize_slice_index(
+                        arguments
+                            .get(1)
+                            .map(Value::to_number)
+                            .unwrap_or(chars.len() as f64),
+                        chars.len(),
+                    )
+                } else {
+                    normalize_index(
+                        arguments
+                            .get(1)
+                            .map(Value::to_number)
+                            .unwrap_or(chars.len() as f64),
+                        chars.len(),
+                    )
+                };
+                if method == "substring" && start > end {
+                    std::mem::swap(&mut start, &mut end);
+                }
+                chars[start..end].iter().collect()
+            }
+            "split" => {
+                let limit = arguments
+                    .get(1)
+                    .map(Value::to_number)
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .map(|value| (value as usize).min(u32::MAX as usize))
+                    .unwrap_or(u32::MAX as usize);
+                let pieces = match arguments.first() {
+                    None | Some(Value::Undefined) => vec![string],
+                    Some(separator) => {
+                        let separator = self.to_string(separator);
+                        if separator.is_empty() {
+                            string
+                                .chars()
+                                .map(|character| character.to_string())
+                                .collect()
+                        } else {
+                            string.split(&separator).map(str::to_owned).collect()
+                        }
+                    }
+                };
+                let array = self.alloc_array();
+                for (index, piece) in pieces.into_iter().take(limit).enumerate() {
+                    self.set_property(array, &index.to_string(), Value::String(piece));
+                }
+                return Ok(Value::Object(array));
+            }
+            _ => string,
+        };
+        Ok(Value::String(result))
+    }
+
+    fn call_object_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        match method {
+            "is" => Ok(Value::Boolean(match arguments.as_slice() {
+                [left, right, ..] => same_value_zero(left, right),
+                _ => false,
+            })),
+            "hasOwnProperty" | "propertyIsEnumerable" => {
+                let Value::Object(object) = this_value else {
+                    return Ok(Value::Boolean(false));
+                };
+                let name = arguments
+                    .first()
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_else(|| "undefined".to_owned());
+                Ok(Value::Boolean(
+                    self.get_own_property(object, &name).is_some()
+                        && (method != "propertyIsEnumerable" || name != "length"),
+                ))
+            }
+            "toString" => match this_value {
+                Value::Null => Ok(Value::String("[object Null]".to_owned())),
+                Value::Undefined => Ok(Value::String("[object Undefined]".to_owned())),
+                Value::Object(id) if self.is_error_object(id) => {
+                    let name = self
+                        .get_property(id, "name")
+                        .map(|value| self.to_string(&value))
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "Error".to_owned());
+                    let message = self
+                        .get_property(id, "message")
+                        .map(|value| self.to_string(&value))
+                        .unwrap_or_default();
+                    Ok(Value::String(if message.is_empty() {
+                        name
+                    } else {
+                        format!("{name}: {message}")
+                    }))
+                }
+                Value::Object(id) if self.objects[id].is_array => {
+                    Ok(Value::String("[object Array]".to_owned()))
+                }
+                Value::Object(id) if self.objects[id].function.is_some() => {
+                    Ok(Value::String("[object Function]".to_owned()))
+                }
+                Value::Object(_) => Ok(Value::String("[object Object]".to_owned())),
+                _ => Ok(Value::String(format!(
+                    "[object {}]",
+                    self.to_string(&this_value)
+                ))),
+            },
+            "hasOwn" => {
+                let Some(Value::Object(id)) = arguments.first() else {
+                    return Ok(Value::Boolean(false));
+                };
+                let name = arguments
+                    .get(1)
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_else(|| "undefined".to_owned());
+                Ok(Value::Boolean(self.get_own_property(*id, &name).is_some()))
+            }
+            "keys" | "getOwnPropertyNames" | "values" | "entries" => {
+                let Some(Value::Object(id)) = arguments.first() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        format!("Object.{method} requires an object"),
+                        1,
+                        1,
+                    ));
+                };
+                let mut names = self.own_property_names(*id);
+                if method == "getOwnPropertyNames" && self.objects[*id].is_array {
+                    names.push("length".to_owned());
+                }
+                let result = self.alloc_array();
+                for (index, name) in names.into_iter().enumerate() {
+                    let value = self
+                        .get_own_property(*id, &name)
+                        .unwrap_or(Value::Undefined);
+                    let item = match method {
+                        "keys" | "getOwnPropertyNames" => Value::String(name),
+                        "values" => value,
+                        _ => {
+                            let pair = self.alloc_array();
+                            self.set_property(pair, "0", Value::String(name));
+                            self.set_property(pair, "1", value);
+                            Value::Object(pair)
+                        }
+                    };
+                    self.set_property(result, &index.to_string(), item);
+                }
+                Ok(Value::Object(result))
+            }
+            "assign" => {
+                let Some(Value::Object(target)) = arguments.first() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Object.assign target must be an object",
+                        1,
+                        1,
+                    ));
+                };
+                for source in arguments.iter().skip(1) {
+                    if let Value::Object(source) = source {
+                        for name in self.own_property_names(*source) {
+                            if let Some(value) = self.get_own_property(*source, &name) {
+                                self.set_property(*target, &name, value);
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Object(*target))
+            }
+            "fromEntries" => {
+                let Some(Value::Object(entries)) = arguments.first() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Object.fromEntries requires an iterable",
+                        1,
+                        1,
+                    ));
+                };
+                if !self.objects[*entries].is_array {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Object.fromEntries requires an array in this runtime",
+                        1,
+                        1,
+                    ));
+                }
+                let result = self.alloc_object(Some(self.object_prototype));
+                for index in 0..self.array_length(*entries) {
+                    let entry = self
+                        .get_property(*entries, &index.to_string())
+                        .unwrap_or(Value::Undefined);
+                    let Value::Object(pair) = entry else {
+                        return Err(EngineError::new(
+                            "TypeError",
+                            "Object.fromEntries entry must be an object",
+                            1,
+                            1,
+                        ));
+                    };
+                    let key = self
+                        .get_property(pair, "0")
+                        .unwrap_or(Value::Undefined)
+                        .to_js_string();
+                    let value = self.get_property(pair, "1").unwrap_or(Value::Undefined);
+                    self.set_property(result, &key, value);
+                }
+                Ok(Value::Object(result))
+            }
+            _ => Ok(Value::Undefined),
+        }
+    }
+
+    fn own_property_names(&self, object: ObjectId) -> Vec<String> {
+        let properties = &self.objects[object];
+        let mut ordered: Vec<String> = properties
+            .property_order
+            .iter()
+            .filter(|name| {
+                properties.properties.contains_key(*name)
+                    && !(properties.is_array && name.as_str() == "length")
+            })
+            .cloned()
+            .collect();
+        for name in properties.properties.keys() {
+            if !ordered.contains(name) && !(properties.is_array && name.as_str() == "length") {
+                ordered.push(name.clone());
+            }
+        }
+        let mut indices = Vec::new();
+        let mut strings = Vec::new();
+        for name in ordered {
+            if let Some(index) = array_index(&name) {
+                indices.push((index, name));
+            } else {
+                strings.push(name);
+            }
+        }
+        indices.sort_by_key(|(index, _)| *index);
+        indices
+            .into_iter()
+            .map(|(_, name)| name)
+            .chain(strings)
+            .collect()
+    }
+
+    fn json_stringify(
+        &self,
+        value: &Value,
+        ancestors: &mut HashSet<ObjectId>,
+    ) -> Result<Option<String>, EngineError> {
+        match value {
+            Value::Undefined => Ok(None),
+            Value::Null => Ok(Some("null".to_owned())),
+            Value::Boolean(value) => Ok(Some(value.to_string())),
+            Value::Number(value) if value.is_finite() && *value == 0.0 => Ok(Some("0".to_owned())),
+            Value::Number(value) if value.is_finite() => Ok(Some(value.to_string())),
+            Value::Number(_) => Ok(Some("null".to_owned())),
+            Value::String(value) => Ok(Some(json_quote(value))),
+            Value::Object(id) if self.objects[*id].function.is_some() => Ok(None),
+            Value::Object(id) => {
+                if !ancestors.insert(*id) {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Converting circular structure to JSON",
+                        1,
+                        1,
+                    ));
+                }
+                let result = if self.objects[*id].is_array {
+                    let length = self.array_length(*id);
+                    let mut parts = Vec::with_capacity(length);
+                    for index in 0..length {
+                        let item = self
+                            .get_property(*id, &index.to_string())
+                            .unwrap_or(Value::Undefined);
+                        parts.push(
+                            self.json_stringify(&item, ancestors)?
+                                .unwrap_or_else(|| "null".to_owned()),
+                        );
+                    }
+                    format!("[{}]", parts.join(","))
+                } else {
+                    let mut parts = Vec::new();
+                    for key in self.own_property_names(*id) {
+                        let item = self.get_own_property(*id, &key).unwrap_or(Value::Undefined);
+                        if let Some(serialized) = self.json_stringify(&item, ancestors)? {
+                            parts.push(format!("{}:{serialized}", json_quote(&key)));
+                        }
+                    }
+                    format!("{{{}}}", parts.join(","))
+                };
+                ancestors.remove(id);
+                Ok(Some(result))
+            }
+        }
+    }
+
+    fn call_math(&mut self, method: &str, arguments: Vec<Value>) -> Result<Value, EngineError> {
+        let argument = |index: usize| arguments.get(index);
+        let number = |index: usize| argument(index).map(Value::to_number).unwrap_or(f64::NAN);
+        let a = number(0);
+        let b = number(1);
+        let value = match method {
+            "abs" => a.abs(),
+            "acos" => a.acos(),
+            "acosh" => a.acosh(),
+            "asin" => a.asin(),
+            "asinh" => a.asinh(),
+            "atan" => a.atan(),
+            "atanh" => a.atanh(),
+            "atan2" => a.atan2(b),
+            "ceil" => a.ceil(),
+            "cos" => a.cos(),
+            "cosh" => a.cosh(),
+            "floor" => a.floor(),
+            "round" => {
+                if (-0.5..0.0).contains(&a) {
+                    -0.0
+                } else {
+                    (a + 0.5).floor()
+                }
+            }
+            "trunc" => a.trunc(),
+            "sqrt" => a.sqrt(),
+            "cbrt" => a.cbrt(),
+            "sign" => {
+                if a.is_nan() || a == 0.0 {
+                    a
+                } else {
+                    a.signum()
+                }
+            }
+            "exp" => a.exp(),
+            "expm1" => a.exp_m1(),
+            "log" => a.ln(),
+            "log1p" => a.ln_1p(),
+            "log2" => a.log2(),
+            "log10" => a.log10(),
+            "sin" => a.sin(),
+            "sinh" => a.sinh(),
+            "tan" => a.tan(),
+            "tanh" => a.tanh(),
+            "pow" => a.powf(b),
+            "min" => {
+                let numbers: Vec<f64> = arguments.iter().map(Value::to_number).collect();
+                if numbers.iter().any(|number| number.is_nan()) {
+                    f64::NAN
+                } else {
+                    numbers.into_iter().fold(f64::INFINITY, f64::min)
+                }
+            }
+            "max" => {
+                let numbers: Vec<f64> = arguments.iter().map(Value::to_number).collect();
+                if numbers.iter().any(|number| number.is_nan()) {
+                    f64::NAN
+                } else {
+                    numbers.into_iter().fold(f64::NEG_INFINITY, f64::max)
+                }
+            }
+            "imul" => (to_uint32(a) as i32).wrapping_mul(to_uint32(b) as i32) as f64,
+            "clz32" => to_uint32(a).leading_zeros() as f64,
+            "fround" => (a as f32) as f64,
+            "hypot" => {
+                let numbers: Vec<f64> = arguments.iter().map(Value::to_number).collect();
+                if numbers.iter().any(|number| number.is_infinite()) {
+                    f64::INFINITY
+                } else if numbers.iter().any(|number| number.is_nan()) {
+                    f64::NAN
+                } else {
+                    numbers.into_iter().fold(0.0_f64, f64::hypot)
+                }
+            }
+            "random" => {
+                let mut state = self.random_state;
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                self.random_state = state;
+                ((state >> 11) as f64) / ((1_u64 << 53) as f64)
+            }
+            "isNaN" => return Ok(Value::Boolean(a.is_nan())),
+            "isFinite" => return Ok(Value::Boolean(a.is_finite())),
+            "isInteger" => {
+                return Ok(Value::Boolean(a.is_finite() && a.fract() == 0.0));
+            }
+            "isSafeInteger" => {
+                return Ok(Value::Boolean(
+                    a.is_finite() && a.fract() == 0.0 && a.abs() <= 9_007_199_254_740_991.0,
+                ));
+            }
+            "parseInt" => {
+                let input = arguments
+                    .first()
+                    .map(Value::to_js_string)
+                    .unwrap_or_else(|| "undefined".to_owned());
+                let input = input.trim();
+                let requested_radix = arguments.get(1).map(Value::to_number).unwrap_or(0.0);
+                if !requested_radix.is_finite() || requested_radix.fract() != 0.0 {
+                    return Ok(Value::Number(f64::NAN));
+                }
+                let mut radix = requested_radix as u32;
+                if requested_radix != 0.0 && !(2..=36).contains(&radix) {
+                    return Ok(Value::Number(f64::NAN));
+                }
+                let sign = if input.starts_with('-') { -1.0 } else { 1.0 };
+                let unsigned = input.trim_start_matches(['-', '+']);
+                if radix == 0 {
+                    radix = if unsigned.starts_with("0x") || unsigned.starts_with("0X") {
+                        16
+                    } else {
+                        10
+                    };
+                }
+                let digits =
+                    if radix == 16 && (unsigned.starts_with("0x") || unsigned.starts_with("0X")) {
+                        &unsigned[2..]
+                    } else {
+                        unsigned
+                    };
+                let valid: String = digits
+                    .chars()
+                    .take_while(|character| character.is_digit(radix))
+                    .collect();
+                return Ok(Value::Number(
+                    i64::from_str_radix(&valid, radix)
+                        .map(|value| sign * value as f64)
+                        .unwrap_or(f64::NAN),
+                ));
+            }
+            "parseFloat" => {
+                let input = arguments
+                    .first()
+                    .map(Value::to_js_string)
+                    .unwrap_or_else(|| "undefined".to_owned());
+                let trimmed = input.trim_start();
+                for end in (1..=trimmed.len()).rev() {
+                    if trimmed.is_char_boundary(end)
+                        && let Ok(parsed) = trimmed[..end].parse::<f64>()
+                    {
+                        return Ok(Value::Number(parsed));
+                    }
+                }
+                return Ok(Value::Number(f64::NAN));
+            }
+            _ => return Ok(Value::Undefined),
+        };
+        Ok(Value::Number(value))
+    }
+
     fn error_object(&mut self, error: &EngineError) -> Value {
         let prototype = self
             .error_prototypes
@@ -1584,6 +3338,9 @@ impl Engine {
                         Value::String(name) if name == "TypeError" => "TypeError",
                         Value::String(name) if name == "ReferenceError" => "ReferenceError",
                         Value::String(name) if name == "SyntaxError" => "SyntaxError",
+                        Value::String(name) if name == "RangeError" => "RangeError",
+                        Value::String(name) if name == "EvalError" => "EvalError",
+                        Value::String(name) if name == "URIError" => "URIError",
                         _ => "Error",
                     })
                     .unwrap_or("Error")
@@ -1601,6 +3358,378 @@ impl Engine {
             thrown: Some(value),
         }
     }
+}
+
+fn array_index(name: &str) -> Option<u32> {
+    let index = name.parse::<u32>().ok()?;
+    (index != u32::MAX && index.to_string() == name).then_some(index)
+}
+
+fn normalize_index(value: f64, length: usize) -> usize {
+    if value.is_nan() || value <= 0.0 {
+        return 0;
+    }
+    if value.is_infinite() || value >= length as f64 {
+        return length;
+    }
+    value.trunc() as usize
+}
+
+fn normalize_slice_index(value: f64, length: usize) -> usize {
+    if value.is_nan() {
+        return 0;
+    }
+    if value == f64::NEG_INFINITY {
+        return 0;
+    }
+    if value == f64::INFINITY {
+        return length;
+    }
+    let index = value.trunc() as isize;
+    if index < 0 {
+        (length as isize + index).max(0) as usize
+    } else {
+        (index as usize).min(length)
+    }
+}
+
+fn normalize_relative_start(value: f64, length: usize) -> usize {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return 0;
+    }
+    if value == f64::INFINITY {
+        return length;
+    }
+    let index = value.trunc() as isize;
+    if index < 0 {
+        (length as isize + index).max(0) as usize
+    } else {
+        (index as usize).min(length)
+    }
+}
+
+fn normalize_relative_index(value: f64, length: usize) -> Option<usize> {
+    if value.is_nan() || value == f64::INFINITY || value == f64::NEG_INFINITY {
+        return None;
+    }
+    let index = value.trunc() as isize;
+    let length = length as isize;
+    let index = if index < 0 { length + index } else { index };
+    (index >= 0 && index < length).then_some(index as usize)
+}
+
+fn same_value_zero(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            left == right || (left.is_nan() && right.is_nan())
+        }
+        _ => left == right,
+    }
+}
+
+struct JsonParser<'a> {
+    input: &'a str,
+    offset: usize,
+}
+
+fn json_quote(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{0008}' => output.push_str("\\b"),
+            '\u{000c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character <= '\u{001f}' => {
+                use std::fmt::Write;
+                write!(&mut output, "\\u{:04x}", character as u32)
+                    .expect("writing to a String cannot fail");
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn format_radix(value: f64, radix: u32) -> String {
+    if value.is_nan() || value.is_infinite() || value == 0.0 {
+        return Value::Number(value).to_js_string();
+    }
+    let negative = value.is_sign_negative();
+    let absolute = value.abs();
+    if absolute >= u64::MAX as f64 {
+        return Value::Number(value).to_js_string();
+    }
+    let mut integer = absolute.trunc() as u64;
+    let mut digits = Vec::new();
+    while integer > 0 {
+        let digit = (integer % u64::from(radix)) as u8;
+        digits.push(if digit < 10 {
+            (b'0' + digit) as char
+        } else {
+            (b'a' + digit - 10) as char
+        });
+        integer /= u64::from(radix);
+    }
+    digits.reverse();
+    let mut result: String = digits.into_iter().collect();
+    let mut fraction = absolute.fract();
+    if fraction != 0.0 {
+        result.push('.');
+        for _ in 0..16 {
+            fraction *= f64::from(radix);
+            let digit = fraction.floor() as u8;
+            result.push(if digit < 10 {
+                (b'0' + digit) as char
+            } else {
+                (b'a' + digit - 10) as char
+            });
+            fraction -= f64::from(digit);
+            if fraction == 0.0 {
+                break;
+            }
+        }
+    }
+    if negative {
+        result.insert(0, '-');
+    }
+    result
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn parse_value(&mut self, engine: &mut Engine) -> Result<Value, EngineError> {
+        let value = self.value(engine)?;
+        self.whitespace();
+        if self.offset != self.input.len() {
+            return Err(self.syntax_error());
+        }
+        Ok(value)
+    }
+
+    fn value(&mut self, engine: &mut Engine) -> Result<Value, EngineError> {
+        self.whitespace();
+        match self.peek() {
+            Some(b'n') => {
+                self.literal(b"null")?;
+                Ok(Value::Null)
+            }
+            Some(b't') => {
+                self.literal(b"true")?;
+                Ok(Value::Boolean(true))
+            }
+            Some(b'f') => {
+                self.literal(b"false")?;
+                Ok(Value::Boolean(false))
+            }
+            Some(b'"') => self.string().map(Value::String),
+            Some(b'[') => {
+                self.offset += 1;
+                let array = engine.alloc_array();
+                self.whitespace();
+                if self.consume(b']') {
+                    return Ok(Value::Object(array));
+                }
+                let mut index = 0;
+                loop {
+                    let item = self.value(engine)?;
+                    engine.set_property(array, &index.to_string(), item);
+                    index += 1;
+                    self.whitespace();
+                    if self.consume(b']') {
+                        break;
+                    }
+                    if !self.consume(b',') {
+                        return Err(self.syntax_error());
+                    }
+                }
+                Ok(Value::Object(array))
+            }
+            Some(b'{') => {
+                self.offset += 1;
+                let object = engine.alloc_object(Some(engine.object_prototype));
+                self.whitespace();
+                if self.consume(b'}') {
+                    return Ok(Value::Object(object));
+                }
+                loop {
+                    self.whitespace();
+                    if self.peek() != Some(b'"') {
+                        return Err(self.syntax_error());
+                    }
+                    let key = self.string()?;
+                    self.whitespace();
+                    if !self.consume(b':') {
+                        return Err(self.syntax_error());
+                    }
+                    let value = self.value(engine)?;
+                    engine.set_property(object, &key, value);
+                    self.whitespace();
+                    if self.consume(b'}') {
+                        break;
+                    }
+                    if !self.consume(b',') {
+                        return Err(self.syntax_error());
+                    }
+                }
+                Ok(Value::Object(object))
+            }
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => Err(self.syntax_error()),
+        }
+    }
+
+    fn string(&mut self) -> Result<String, EngineError> {
+        if !self.consume(b'"') {
+            return Err(self.syntax_error());
+        }
+        let mut units = Vec::new();
+        loop {
+            let Some(byte) = self.peek() else {
+                return Err(self.syntax_error());
+            };
+            match byte {
+                b'"' => {
+                    self.offset += 1;
+                    return Ok(std::char::decode_utf16(units)
+                        .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
+                        .collect());
+                }
+                b'\\' => {
+                    self.offset += 1;
+                    let Some(escape) = self.peek() else {
+                        return Err(self.syntax_error());
+                    };
+                    self.offset += 1;
+                    match escape {
+                        b'"' => units.push(b'"' as u16),
+                        b'\\' => units.push(b'\\' as u16),
+                        b'/' => units.push(b'/' as u16),
+                        b'b' => units.push(0x0008),
+                        b'f' => units.push(0x000c),
+                        b'n' => units.push(b'\n' as u16),
+                        b'r' => units.push(b'\r' as u16),
+                        b't' => units.push(b'\t' as u16),
+                        b'u' => {
+                            let end = self.offset + 4;
+                            let digits = self
+                                .input
+                                .get(self.offset..end)
+                                .ok_or_else(|| self.syntax_error())?;
+                            let unit =
+                                u16::from_str_radix(digits, 16).map_err(|_| self.syntax_error())?;
+                            units.push(unit);
+                            self.offset = end;
+                        }
+                        _ => return Err(self.syntax_error()),
+                    }
+                }
+                0..=0x1f => return Err(self.syntax_error()),
+                _ => {
+                    let character = self.input[self.offset..]
+                        .chars()
+                        .next()
+                        .ok_or_else(|| self.syntax_error())?;
+                    let mut encoded = [0; 2];
+                    units.extend(character.encode_utf16(&mut encoded).iter().copied());
+                    self.offset += character.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn number(&mut self) -> Result<Value, EngineError> {
+        let start = self.offset;
+        self.consume(b'-');
+        match self.peek() {
+            Some(b'0') => {
+                self.offset += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(self.syntax_error());
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.offset += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.offset += 1;
+                }
+            }
+            _ => return Err(self.syntax_error()),
+        }
+        if self.consume(b'.') {
+            let fraction_start = self.offset;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.offset += 1;
+            }
+            if fraction_start == self.offset {
+                return Err(self.syntax_error());
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.offset += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.offset += 1;
+            }
+            let exponent_start = self.offset;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.offset += 1;
+            }
+            if exponent_start == self.offset {
+                return Err(self.syntax_error());
+            }
+        }
+        self.input[start..self.offset]
+            .parse::<f64>()
+            .map(Value::Number)
+            .map_err(|_| self.syntax_error())
+    }
+
+    fn literal(&mut self, literal: &[u8]) -> Result<(), EngineError> {
+        if self.input.as_bytes()[self.offset..].starts_with(literal) {
+            self.offset += literal.len();
+            Ok(())
+        } else {
+            Err(self.syntax_error())
+        }
+    }
+
+    fn whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            self.offset += 1;
+        }
+    }
+
+    fn consume(&mut self, byte: u8) -> bool {
+        if self.peek() == Some(byte) {
+            self.offset += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.offset).copied()
+    }
+
+    fn syntax_error(&self) -> EngineError {
+        EngineError::new("SyntaxError", "Invalid JSON text", 1, 1)
+    }
+}
+
+fn to_uint32(value: f64) -> u32 {
+    if !value.is_finite() || value == 0.0 {
+        return 0;
+    }
+    value.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 impl Default for Engine {
@@ -2005,5 +4134,155 @@ mod tests {
         assert_eq!(engine.eval("missing").unwrap_err().name, "ReferenceError");
         engine.eval("const locked = 1;").unwrap();
         assert_eq!(engine.eval("locked = 2").unwrap_err().name, "TypeError");
+    }
+
+    #[test]
+    fn arrays_support_sparse_elements_and_common_mutation_methods() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string("let items = [1,,3]; items.push(4); items.pop(); items.join('-')",)
+                .unwrap(),
+            "1--3"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("items.length + ':' + (1 in items) + ':' + Array.isArray(items)",)
+                .unwrap(),
+            "3:false:true"
+        );
+        assert_eq!(
+            engine.eval_to_string("items.slice(-2).join(',')").unwrap(),
+            ",3"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("Array.of(2, 4).reverse().join(',')")
+                .unwrap(),
+            "4,2"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let removed = items.splice(1, 1, 8); items.toString() + ':' + removed.toString()",
+                )
+                .unwrap(),
+            "1,8,3:"
+        );
+        assert_eq!(engine.eval_to_string("Array(3).join('-')").unwrap(), "--");
+        assert_eq!(
+            engine
+                .eval_to_string("let nested = []; nested.push(nested); nested.join(',') + ':' + nested.toString()")
+                .unwrap(),
+            ":"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("[3,1,2].sort().copyWithin(1, 0, 2).join(',')",)
+                .unwrap(),
+            "1,1,2"
+        );
+        assert_eq!(
+            engine
+                .eval("let invalidArray = []; invalidArray.length = -1")
+                .unwrap_err()
+                .name,
+            "RangeError"
+        );
+    }
+
+    #[test]
+    fn array_callback_and_conversion_methods_work() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine.eval_to_string(
+                "[1,2,3,4].map(function(value) { return value * 2; }).filter(function(value) { return value > 4; }).reduce(function(total, value) { return total + value; }, 0)",
+            ).unwrap(),
+            "14"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("Array.from({ 0: 'a', 1: 'b', length: 2 }).join('-')",)
+                .unwrap(),
+            "a-b"
+        );
+        assert_eq!(
+            engine.eval_to_string("[1,,3].includes(undefined)").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            engine.eval_to_string("[1,,3].indexOf(undefined)").unwrap(),
+            "-1"
+        );
+    }
+
+    #[test]
+    fn primitive_math_object_and_json_builtins_are_available() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine.eval_to_string(
+                "String.fromCharCode(65, 66).toLowerCase() + ':' + Number.isInteger(4) + ':' + Math.max(2, 7) + ':' + parseInt('12px')",
+            ).unwrap(),
+            "ab:true:7:12"
+        );
+        assert_eq!(
+            engine.eval_to_string(
+                "let decoded = JSON.parse('{\"items\":[1,true,null],\"text\":\"ok\"}'); JSON.stringify(decoded)",
+            ).unwrap(),
+            "{\"items\":[1,true,null],\"text\":\"ok\"}"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("JSON.stringify({ second: 2, first: 1 })")
+                .unwrap(),
+            "{\"second\":2,\"first\":1}"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "Object.fromEntries([['answer', 42]]).answer + ':' + Object.getOwnPropertyNames([1]).join(',')",
+                )
+                .unwrap(),
+            "42:0,length"
+        );
+        assert_eq!(
+            engine
+                .eval("let circular = []; circular.push(circular); JSON.stringify(circular)")
+                .unwrap_err()
+                .name,
+            "TypeError"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("'hello'.toUpperCase() + ':' + 'a,b'.split(',')[1]")
+                .unwrap(),
+            "HELLO:b"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "Object.is(NaN, NaN) + ':' + Object.hasOwn({ value: 1 }, 'value') + ':' + (42).toString(2)",
+                )
+                .unwrap(),
+            "true:true:101010"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "[1,2,3].reduceRight(function(total, item) { return total - item; })"
+                )
+                .unwrap(),
+            "0"
+        );
+        assert_eq!(
+            engine
+                .eval("Math.random() >= 0 && Math.random() < 1")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            engine.eval("JSON.parse('{invalid}')").unwrap_err().name,
+            "SyntaxError"
+        );
     }
 }

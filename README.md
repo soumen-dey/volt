@@ -26,19 +26,30 @@ The interpreter currently supports:
   function names/length, `arguments`, and strict/sloppy direct-call `this`
 - object literals, property reads/writes, constructor calls, prototype lookup,
   `in`, `instanceof`, and `Object.create`, `Object.getPrototypeOf`, and
-  `Object.setPrototypeOf`
+  `Object.setPrototypeOf`, plus basic `Object.keys`, `getOwnPropertyNames`,
+  `values`, `entries`, `assign`, `fromEntries`, `hasOwn`, and `is`
+- sparse array literals and basic `Array` construction, indexed properties,
+  mutable `length`, and common array methods (`push`, `pop`, `shift`,
+  `unshift`, `splice`, `slice`, `concat`, `join`, `reverse`, searches, and
+  callback methods)
+- selected `String`, `Number`, and `Boolean` conversions and prototype methods,
+  `Math`, global numeric conversion helpers, and `JSON.parse`/`JSON.stringify`
 - `try`/`catch`/`finally`, explicit throws, and basic `Error`,
-  `TypeError`, `ReferenceError`, and `SyntaxError` objects
+  `EvalError`, `RangeError`, `ReferenceError`, `SyntaxError`, `TypeError`,
+  and `URIError` objects
 - line and block comments
 - a persistent global environment across evaluations
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
-Arrays, classes, many constructor edge cases, complete `this` binding rules,
-complete ECMAScript error objects, modules, promises/jobs, and most standard
-built-ins are not implemented. The parser and runtime semantics remain a
-limited subset; passing the focused Rust tests does not establish general
-ECMAScript conformance. Unsupported syntax reports a `SyntaxError`. Object and
-scope storage is engine-owned and reclaimed
+The built-ins are a focused subset, not the full ECMAScript standard library.
+Array iteration protocols and some methods, complete string/number behavior,
+property descriptors, `Date`, `RegExp`, `Symbol`, `BigInt`, `Proxy`, `Reflect`,
+modules, promises/jobs, and many other specified APIs are not implemented.
+Classes, many constructor edge cases, complete `this` binding rules, and
+complete ECMAScript error objects are also missing. The parser and runtime
+semantics remain a limited subset; passing the focused Rust tests does not
+establish general ECMAScript conformance. Unsupported syntax reports a
+`SyntaxError`. Object and scope storage is engine-owned and reclaimed
 when the engine is dropped; there is no garbage collector yet, so long-running
 engines retain allocations made by evaluated scripts. This implementation must
 not be used to execute untrusted or unbounded scripts; it does not yet enforce

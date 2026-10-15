@@ -73,6 +73,7 @@ pub(crate) enum Expr {
         strict: bool,
     },
     Object(Vec<(String, Expr)>),
+    Array(Vec<Option<Expr>>),
     Member(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
@@ -646,6 +647,9 @@ impl Parser {
         if self.matches(&TokenKind::LeftBrace) {
             return self.object_literal();
         }
+        if self.matches(&TokenKind::LeftBracket) {
+            return self.array_literal();
+        }
         let token = self.advance().clone();
         match token.kind {
             TokenKind::Number(value) => Ok(Expr::Literal(Value::Number(value))),
@@ -697,6 +701,22 @@ impl Parser {
         }
         self.consume(&TokenKind::RightBrace, "Expected '}' after object literal")?;
         Ok(Expr::Object(properties))
+    }
+
+    fn array_literal(&mut self) -> Result<Expr, EngineError> {
+        let mut elements = Vec::new();
+        while !self.check(&TokenKind::RightBracket) && !self.is_at_end() {
+            if self.matches(&TokenKind::Comma) {
+                elements.push(None);
+                continue;
+            }
+            elements.push(Some(self.assignment()?));
+            if !self.matches(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.consume(&TokenKind::RightBracket, "Expected ']' after array literal")?;
+        Ok(Expr::Array(elements))
     }
 
     fn current_binary_operator(&self) -> Option<(BinaryOp, u8)> {
@@ -1031,6 +1051,12 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), EngineError> {
         Expr::Object(properties) => {
             for (_, value) in properties {
                 validate_strict_expression(value)?;
+            }
+            Ok(())
+        }
+        Expr::Array(elements) => {
+            for expression in elements.iter().flatten() {
+                validate_strict_expression(expression)?;
             }
             Ok(())
         }
