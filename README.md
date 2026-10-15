@@ -37,6 +37,7 @@ The interpreter currently supports:
   searches, and callback methods)
 - selected `String`, `Number`, and `Boolean` conversions and prototype methods,
   `Math`, global numeric conversion helpers, and `JSON.parse`/`JSON.stringify`
+  with replacer and indentation arguments
 - `try`/`catch`/`finally`, explicit throws, and basic `Error`,
   `EvalError`, `RangeError`, `ReferenceError`, `SyntaxError`, `TypeError`,
   and `URIError` objects

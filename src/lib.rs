@@ -2718,11 +2718,7 @@ impl Engine {
             NativeFunction::Json(method) => match method {
                 "stringify" => match arguments.first() {
                     None | Some(Value::Undefined) => Ok(Value::Undefined),
-                    Some(value) => self
-                        .json_stringify(value, &mut HashSet::new())?
-                        .map(Value::String)
-                        .map(Ok)
-                        .unwrap_or(Ok(Value::Undefined)),
+                    Some(value) => self.json_stringify_with_options(value.clone(), &arguments),
                 },
                 "parse" => {
                     let input = arguments
@@ -4024,22 +4020,97 @@ impl Engine {
             .collect()
     }
 
-    fn json_stringify(
-        &self,
-        value: &Value,
+    fn json_stringify_with_options(
+        &mut self,
+        value: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EngineError> {
+        let replacer = arguments.get(1).cloned();
+        let replacer_function = replacer.as_ref().filter(
+            |value| matches!(value, Value::Object(id) if self.objects[*id].function.is_some()),
+        );
+        let property_list = if let Some(Value::Object(id)) = &replacer
+            && self.objects[*id].is_array
+        {
+            let length = self.array_length(*id);
+            let mut names = Vec::new();
+            for index in 0..length {
+                let Some(value) = self.get_property(*id, &index.to_string()) else {
+                    continue;
+                };
+                let name = match value {
+                    Value::String(value) => Some(value),
+                    Value::Number(value) => Some(Value::Number(value).to_js_string()),
+                    _ => None,
+                };
+                if let Some(name) = name
+                    && !names.contains(&name)
+                {
+                    names.push(name);
+                }
+            }
+            Some(names)
+        } else {
+            None
+        };
+        let gap = match arguments.get(2) {
+            Some(Value::Number(value)) if value.is_finite() && *value > 0.0 => {
+                " ".repeat((*value as usize).min(10))
+            }
+            Some(Value::String(value)) => value.chars().take(10).collect(),
+            _ => String::new(),
+        };
+        let root = self.alloc_object(Some(self.object_prototype));
+        self.set_property(root, "", value.clone());
+        let serialized = self.json_stringify_property(
+            Value::Object(root),
+            "",
+            value,
+            replacer_function.cloned(),
+            property_list.as_deref(),
+            &gap,
+            "",
+            &mut HashSet::new(),
+        )?;
+        Ok(serialized.map(Value::String).unwrap_or(Value::Undefined))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn json_stringify_property(
+        &mut self,
+        holder: Value,
+        key: &str,
+        mut value: Value,
+        replacer: Option<Value>,
+        property_list: Option<&[String]>,
+        gap: &str,
+        indent: &str,
         ancestors: &mut HashSet<ObjectId>,
     ) -> Result<Option<String>, EngineError> {
+        if let Value::Object(id) = value.clone()
+            && let Some(to_json) = self.get_property(id, "toJSON")
+            && matches!(to_json, Value::Object(function) if self.objects[function].function.is_some())
+        {
+            value = self.call(
+                to_json,
+                Value::Object(id),
+                vec![Value::String(key.to_owned())],
+            )?;
+        }
+        if let Some(replacer) = replacer.clone() {
+            value = self.call(replacer, holder, vec![Value::String(key.to_owned()), value])?;
+        }
         match value {
             Value::Undefined => Ok(None),
             Value::Null => Ok(Some("null".to_owned())),
             Value::Boolean(value) => Ok(Some(value.to_string())),
-            Value::Number(value) if value.is_finite() && *value == 0.0 => Ok(Some("0".to_owned())),
+            Value::Number(value) if value.is_finite() && value == 0.0 => Ok(Some("0".to_owned())),
             Value::Number(value) if value.is_finite() => Ok(Some(value.to_string())),
             Value::Number(_) => Ok(Some("null".to_owned())),
-            Value::String(value) => Ok(Some(json_quote(value))),
-            Value::Object(id) if self.objects[*id].function.is_some() => Ok(None),
+            Value::String(value) => Ok(Some(json_quote(&value))),
+            Value::Object(id) if self.objects[id].function.is_some() => Ok(None),
             Value::Object(id) => {
-                if !ancestors.insert(*id) {
+                if !ancestors.insert(id) {
                     return Err(EngineError::new(
                         "TypeError",
                         "Converting circular structure to JSON",
@@ -4047,31 +4118,77 @@ impl Engine {
                         1,
                     ));
                 }
-                let result = if self.objects[*id].is_array {
-                    let length = self.array_length(*id);
+                let next_indent = format!("{indent}{gap}");
+                if self.objects[id].is_array {
+                    let length = self.array_length(id);
                     let mut parts = Vec::with_capacity(length);
                     for index in 0..length {
-                        let item = self
-                            .get_property(*id, &index.to_string())
-                            .unwrap_or(Value::Undefined);
+                        let item_key = index.to_string();
+                        let item =
+                            self.get_property_with_receiver(id, Value::Object(id), &item_key)?;
                         parts.push(
-                            self.json_stringify(&item, ancestors)?
-                                .unwrap_or_else(|| "null".to_owned()),
+                            self.json_stringify_property(
+                                Value::Object(id),
+                                &item_key,
+                                item,
+                                replacer.clone(),
+                                property_list,
+                                gap,
+                                &next_indent,
+                                ancestors,
+                            )?
+                            .unwrap_or_else(|| "null".to_owned()),
                         );
                     }
-                    format!("[{}]", parts.join(","))
+                    let serialized = if gap.is_empty() || parts.is_empty() {
+                        format!("[{}]", parts.join(","))
+                    } else {
+                        format!(
+                            "[\n{}{}\n{}]",
+                            next_indent,
+                            parts.join(&format!(",\n{next_indent}")),
+                            indent
+                        )
+                    };
+                    ancestors.remove(&id);
+                    Ok(Some(serialized))
                 } else {
+                    let names = property_list
+                        .map(<[String]>::to_vec)
+                        .unwrap_or_else(|| self.enumerable_property_names(id));
                     let mut parts = Vec::new();
-                    for key in self.enumerable_property_names(*id) {
-                        let item = self.get_own_property(*id, &key).unwrap_or(Value::Undefined);
-                        if let Some(serialized) = self.json_stringify(&item, ancestors)? {
-                            parts.push(format!("{}:{serialized}", json_quote(&key)));
+                    for key in names {
+                        if !self.objects[id].properties.contains_key(&key) {
+                            continue;
+                        }
+                        let item = self.get_property_with_receiver(id, Value::Object(id), &key)?;
+                        if let Some(serialized) = self.json_stringify_property(
+                            Value::Object(id),
+                            &key,
+                            item,
+                            replacer.clone(),
+                            property_list,
+                            gap,
+                            &next_indent,
+                            ancestors,
+                        )? {
+                            let separator = if gap.is_empty() { ":" } else { ": " };
+                            parts.push(format!("{}{separator}{serialized}", json_quote(&key)));
                         }
                     }
-                    format!("{{{}}}", parts.join(","))
-                };
-                ancestors.remove(id);
-                Ok(Some(result))
+                    let serialized = if gap.is_empty() || parts.is_empty() {
+                        format!("{{{}}}", parts.join(","))
+                    } else {
+                        format!(
+                            "{{\n{}{}\n{}}}",
+                            next_indent,
+                            parts.join(&format!(",\n{next_indent}")),
+                            indent
+                        )
+                    };
+                    ancestors.remove(&id);
+                    Ok(Some(serialized))
+                }
             }
         }
     }
@@ -5187,6 +5304,34 @@ mod tests {
                 .eval_to_string("JSON.stringify({ second: 2, first: 1 })")
                 .unwrap(),
             "{\"second\":2,\"first\":1}"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("JSON.stringify({ first: 1, second: 2 }, ['second'], 2)",)
+                .unwrap(),
+            "{\n  \"second\": 2\n}"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "JSON.stringify({ value: 3 }, function(key, value) { return typeof value === 'number' ? value * 2 : value; })",
+                )
+                .unwrap(),
+            "{\"value\":6}"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("JSON.stringify({ value: 3 }, null, '---')",)
+                .unwrap(),
+            "{\n---\"value\": 3\n}"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let serializable = { value: 2, toJSON: function(key) { return { key: key, value: this.value }; } }; JSON.stringify(serializable)",
+                )
+                .unwrap(),
+            "{\"key\":\"\",\"value\":2}"
         );
         assert_eq!(
             engine
