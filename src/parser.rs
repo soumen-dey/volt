@@ -6,6 +6,7 @@ pub(crate) enum UnaryOp {
     Not,
     Plus,
     Minus,
+    BitNot,
     TypeOf,
     Void,
     Delete,
@@ -18,6 +19,13 @@ pub(crate) enum BinaryOp {
     Multiply,
     Divide,
     Remainder,
+    Exponent,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
+    UnsignedShiftRight,
     StrictEqual,
     StrictNotEqual,
     Equal,
@@ -52,8 +60,17 @@ pub(crate) enum Expr {
     Assignment {
         target: Box<Expr>,
         value: Box<Expr>,
-        line: usize,
-        column: usize,
+        operator: Option<BinaryOp>,
+    },
+    Conditional {
+        test: Box<Expr>,
+        consequent: Box<Expr>,
+        alternate: Box<Expr>,
+    },
+    Update {
+        target: Box<Expr>,
+        increment: bool,
+        prefix: bool,
     },
     Unary {
         operator: UnaryOp,
@@ -120,6 +137,13 @@ pub(crate) enum Stmt {
         condition: Option<Expr>,
         update: Option<Expr>,
         body: Box<Stmt>,
+    },
+    ForEach {
+        name: String,
+        kind: DeclarationKind,
+        iterable: Expr,
+        body: Box<Stmt>,
+        is_of: bool,
     },
     DoWhile {
         body: Box<Stmt>,
@@ -259,12 +283,13 @@ impl Parser {
     }
 
     fn declaration(&mut self) -> Result<Stmt, EngineError> {
-        self.declaration_with_terminator(true)
+        self.declaration_with_terminator(true, false)
     }
 
     fn declaration_with_terminator(
         &mut self,
         consume_terminator: bool,
+        allow_missing_const_initializer: bool,
     ) -> Result<Stmt, EngineError> {
         let keyword = self.previous().clone();
         let kind = match &keyword.kind {
@@ -278,7 +303,10 @@ impl Parser {
         } else {
             None
         };
-        if kind == DeclarationKind::Const && initializer.is_none() {
+        if kind == DeclarationKind::Const
+            && initializer.is_none()
+            && !allow_missing_const_initializer
+        {
             return Err(self.error_at(&keyword, "A const declaration requires an initializer"));
         }
         if consume_terminator {
@@ -329,7 +357,51 @@ impl Parser {
             || self.matches_keyword("const")
             || self.matches_keyword("var")
         {
-            let declaration = self.declaration_with_terminator(false)?;
+            let declaration = self.declaration_with_terminator(false, true)?;
+            if self.matches_keyword("of") || self.matches_keyword("in") {
+                let is_of = matches!(
+                    &self.previous().kind,
+                    TokenKind::Identifier(operator) if operator == "of"
+                );
+                let (name, kind) = match declaration {
+                    Stmt::Declaration {
+                        name,
+                        kind,
+                        initializer,
+                        ..
+                    } => {
+                        if initializer.is_some() {
+                            return Err(
+                                self.error_here("A for-in/of binding cannot have an initializer")
+                            );
+                        }
+                        (name, kind)
+                    }
+                    _ => unreachable!("declaration parser returns a declaration"),
+                };
+                let iterable = self.expression()?;
+                self.consume(&TokenKind::RightParen, "Expected ')' after for-in/of head")?;
+                self.loop_depth += 1;
+                let body = self.statement_body();
+                self.loop_depth -= 1;
+                return Ok(Stmt::ForEach {
+                    name,
+                    kind,
+                    iterable,
+                    body: Box::new(body?),
+                    is_of,
+                });
+            }
+            if matches!(
+                &declaration,
+                Stmt::Declaration {
+                    kind: DeclarationKind::Const,
+                    initializer: None,
+                    ..
+                }
+            ) {
+                return Err(self.error_here("A const declaration requires an initializer"));
+            }
             self.consume(&TokenKind::Semicolon, "Expected ';' after for initializer")?;
             Some(Box::new(declaration))
         } else {
@@ -496,8 +568,31 @@ impl Parser {
     }
 
     fn assignment(&mut self) -> Result<Expr, EngineError> {
-        let expression = self.binary(1)?;
-        if self.matches_operator("=") {
+        let expression = self.conditional()?;
+        let operator = match &self.peek().kind {
+            TokenKind::Operator(operator) => match operator.as_str() {
+                "=" => Some(None),
+                "+=" => Some(Some(BinaryOp::Add)),
+                "-=" => Some(Some(BinaryOp::Subtract)),
+                "*=" => Some(Some(BinaryOp::Multiply)),
+                "/=" => Some(Some(BinaryOp::Divide)),
+                "%=" => Some(Some(BinaryOp::Remainder)),
+                "**=" => Some(Some(BinaryOp::Exponent)),
+                "&=" => Some(Some(BinaryOp::BitAnd)),
+                "|=" => Some(Some(BinaryOp::BitOr)),
+                "^=" => Some(Some(BinaryOp::BitXor)),
+                "<<=" => Some(Some(BinaryOp::ShiftLeft)),
+                ">>=" => Some(Some(BinaryOp::ShiftRight)),
+                ">>>=" => Some(Some(BinaryOp::UnsignedShiftRight)),
+                "&&=" => Some(Some(BinaryOp::And)),
+                "||=" => Some(Some(BinaryOp::Or)),
+                "??=" => Some(Some(BinaryOp::Nullish)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(operator) = operator {
+            self.advance();
             let equals = self.previous().clone();
             let value = self.assignment()?;
             if matches!(
@@ -507,13 +602,28 @@ impl Parser {
                 return Ok(Expr::Assignment {
                     target: Box::new(expression),
                     value: Box::new(value),
-                    line: equals.line,
-                    column: equals.column,
+                    operator,
                 });
             }
             return Err(self.error_at(&equals, "Invalid assignment target"));
         }
         Ok(expression)
+    }
+
+    fn conditional(&mut self) -> Result<Expr, EngineError> {
+        let test = self.binary(1)?;
+        if self.matches_operator("?") {
+            let consequent = self.assignment()?;
+            self.consume(&TokenKind::Colon, "Expected ':' in conditional expression")?;
+            let alternate = self.assignment()?;
+            Ok(Expr::Conditional {
+                test: Box::new(test),
+                consequent: Box::new(consequent),
+                alternate: Box::new(alternate),
+            })
+        } else {
+            Ok(test)
+        }
     }
 
     fn binary(&mut self, minimum_precedence: u8) -> Result<Expr, EngineError> {
@@ -523,7 +633,12 @@ impl Parser {
                 break;
             }
             self.advance();
-            let right = self.binary(precedence + 1)?;
+            let right_precedence = if operator == BinaryOp::Exponent {
+                precedence
+            } else {
+                precedence + 1
+            };
+            let right = self.binary(right_precedence)?;
             expression = Expr::Binary {
                 operator,
                 left: Box::new(expression),
@@ -539,6 +654,7 @@ impl Parser {
                 "!" => Some(UnaryOp::Not),
                 "+" => Some(UnaryOp::Plus),
                 "-" => Some(UnaryOp::Minus),
+                "~" => Some(UnaryOp::BitNot),
                 _ => None,
             };
             if let Some(operator) = unary {
@@ -550,6 +666,24 @@ impl Parser {
                     column: token.column,
                 });
             }
+        }
+        if self.matches_operator("++") || self.matches_operator("--") {
+            let increment = matches!(
+                &self.previous().kind,
+                TokenKind::Operator(operator) if operator == "++"
+            );
+            let target = self.unary()?;
+            if !matches!(
+                target,
+                Expr::Identifier { .. } | Expr::Member(_, _) | Expr::Index(_, _)
+            ) {
+                return Err(self.error_here("Invalid update target"));
+            }
+            return Ok(Expr::Update {
+                target: Box::new(target),
+                increment,
+                prefix: true,
+            });
         }
         if self.matches_keyword("typeof")
             || self.matches_keyword("void")
@@ -596,6 +730,26 @@ impl Parser {
                 }
                 self.consume(&TokenKind::RightParen, "Expected ')' after arguments")?;
                 expression = Expr::Call(Box::new(expression), arguments);
+            } else if self.matches_operator("++") || self.matches_operator("--") {
+                let increment = matches!(
+                    &self.previous().kind,
+                    TokenKind::Operator(operator) if operator == "++"
+                );
+                if self.peek().line > self.previous().line {
+                    self.current -= 1;
+                    break;
+                }
+                if !matches!(
+                    expression,
+                    Expr::Identifier { .. } | Expr::Member(_, _) | Expr::Index(_, _)
+                ) {
+                    return Err(self.error_here("Invalid update target"));
+                }
+                expression = Expr::Update {
+                    target: Box::new(expression),
+                    increment,
+                    prefix: false,
+                };
             } else {
                 break;
             }
@@ -728,21 +882,28 @@ impl Parser {
             "??" => (BinaryOp::Nullish, 1),
             "||" => (BinaryOp::Or, 2),
             "&&" => (BinaryOp::And, 3),
-            "==" => (BinaryOp::Equal, 4),
-            "!=" => (BinaryOp::NotEqual, 4),
-            "===" => (BinaryOp::StrictEqual, 4),
-            "!==" => (BinaryOp::StrictNotEqual, 4),
-            "<" => (BinaryOp::LessThan, 5),
-            "<=" => (BinaryOp::LessThanOrEqual, 5),
-            ">" => (BinaryOp::GreaterThan, 5),
-            ">=" => (BinaryOp::GreaterThanOrEqual, 5),
-            "in" => (BinaryOp::In, 5),
-            "instanceof" => (BinaryOp::InstanceOf, 5),
-            "+" => (BinaryOp::Add, 6),
-            "-" => (BinaryOp::Subtract, 6),
-            "*" => (BinaryOp::Multiply, 7),
-            "/" => (BinaryOp::Divide, 7),
-            "%" => (BinaryOp::Remainder, 7),
+            "|" => (BinaryOp::BitOr, 4),
+            "^" => (BinaryOp::BitXor, 5),
+            "&" => (BinaryOp::BitAnd, 6),
+            "==" => (BinaryOp::Equal, 7),
+            "!=" => (BinaryOp::NotEqual, 7),
+            "===" => (BinaryOp::StrictEqual, 7),
+            "!==" => (BinaryOp::StrictNotEqual, 7),
+            "<" => (BinaryOp::LessThan, 8),
+            "<=" => (BinaryOp::LessThanOrEqual, 8),
+            ">" => (BinaryOp::GreaterThan, 8),
+            ">=" => (BinaryOp::GreaterThanOrEqual, 8),
+            "in" => (BinaryOp::In, 8),
+            "instanceof" => (BinaryOp::InstanceOf, 8),
+            "<<" => (BinaryOp::ShiftLeft, 9),
+            ">>" => (BinaryOp::ShiftRight, 9),
+            ">>>" => (BinaryOp::UnsignedShiftRight, 9),
+            "+" => (BinaryOp::Add, 10),
+            "-" => (BinaryOp::Subtract, 10),
+            "*" => (BinaryOp::Multiply, 11),
+            "/" => (BinaryOp::Divide, 11),
+            "%" => (BinaryOp::Remainder, 11),
+            "**" => (BinaryOp::Exponent, 12),
             _ => return None,
         })
     }
@@ -977,6 +1138,16 @@ fn validate_strict_statements(statements: &[Stmt]) -> Result<(), EngineError> {
                 }
                 validate_strict_statements(std::slice::from_ref(body))?;
             }
+            Stmt::ForEach {
+                name,
+                iterable,
+                body,
+                ..
+            } => {
+                validate_strict_name(name)?;
+                validate_strict_expression(iterable)?;
+                validate_strict_statements(std::slice::from_ref(body))?;
+            }
             Stmt::DoWhile { body, condition } => {
                 validate_strict_statements(std::slice::from_ref(body))?;
                 validate_strict_expression(condition)?;
@@ -1027,6 +1198,16 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), EngineError> {
             validate_strict_expression(target)?;
             validate_strict_expression(value)
         }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            validate_strict_expression(test)?;
+            validate_strict_expression(consequent)?;
+            validate_strict_expression(alternate)
+        }
+        Expr::Update { target, .. } => validate_strict_expression(target),
         Expr::Unary {
             operator: UnaryOp::Delete,
             operand,

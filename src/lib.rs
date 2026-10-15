@@ -151,6 +151,7 @@ enum Function {
 struct Object {
     properties: HashMap<String, Value>,
     property_order: Vec<String>,
+    non_enumerable: HashSet<String>,
     parameter_map: HashMap<String, (ScopeId, String)>,
     prototype: Option<ObjectId>,
     function: Option<Function>,
@@ -162,6 +163,21 @@ enum Completion {
     Return(Value),
     Break,
     Continue,
+}
+
+enum Reference {
+    Binding {
+        scope: ScopeId,
+        name: String,
+        line: usize,
+        column: usize,
+    },
+    Property {
+        base: Value,
+        name: String,
+        line: usize,
+        column: usize,
+    },
 }
 
 /// A from-scratch, headless JavaScript interpreter for the subset listed in
@@ -251,6 +267,9 @@ impl Engine {
             "constructor",
             Value::Object(object_constructor),
         );
+        engine.objects[object_prototype]
+            .non_enumerable
+            .insert("constructor".to_owned());
         engine.declare_global("Object", Value::Object(object_constructor), false);
         engine.install_object_builtins(object_constructor);
         engine.install_array_builtins();
@@ -308,7 +327,7 @@ impl Engine {
             };
             self.set_property(prototype, "name", Value::String(name.to_owned()));
             self.set_property(prototype, "message", Value::String(String::new()));
-            self.set_property(prototype, "constructor", Value::Object(constructor));
+            self.set_builtin_property(prototype, "constructor", Value::Object(constructor));
             self.set_property(constructor, "prototype", Value::Object(prototype));
             self.set_property(constructor, "name", Value::String(name.to_owned()));
             self.set_property(constructor, "length", Value::Number(1.0));
@@ -340,7 +359,7 @@ impl Engine {
         );
         self.set_property(method, "name", Value::String("toString".to_owned()));
         self.set_property(method, "length", Value::Number(0.0));
-        self.set_property(self.object_prototype, "toString", Value::Object(method));
+        self.set_builtin_property(self.object_prototype, "toString", Value::Object(method));
         for (name, arity) in [("hasOwnProperty", 1.0), ("propertyIsEnumerable", 1.0)] {
             let method = self.alloc_native(
                 NativeFunction::ObjectMethod(name),
@@ -348,7 +367,7 @@ impl Engine {
             );
             self.set_property(method, "name", Value::String(name.to_owned()));
             self.set_property(method, "length", Value::Number(arity));
-            self.set_property(self.object_prototype, name, Value::Object(method));
+            self.set_builtin_property(self.object_prototype, name, Value::Object(method));
         }
         let is = self.alloc_native(
             NativeFunction::ObjectMethod("is"),
@@ -368,7 +387,7 @@ impl Engine {
             "prototype",
             Value::Object(self.array_prototype),
         );
-        self.set_property(
+        self.set_builtin_property(
             self.array_prototype,
             "constructor",
             Value::Object(constructor),
@@ -420,7 +439,7 @@ impl Engine {
             );
             self.set_property(function, "name", Value::String(name.to_owned()));
             self.set_property(function, "length", Value::Number(arity));
-            self.set_property(self.array_prototype, name, Value::Object(function));
+            self.set_builtin_property(self.array_prototype, name, Value::Object(function));
         }
         self.declare_global("Array", Value::Object(constructor), false);
     }
@@ -464,7 +483,7 @@ impl Engine {
             );
             self.set_property(function, "name", Value::String(name.to_owned()));
             self.set_property(function, "length", Value::Number(length));
-            self.set_property(self.string_prototype, name, Value::Object(function));
+            self.set_builtin_property(self.string_prototype, name, Value::Object(function));
         }
         for (name, arity) in [("fromCharCode", 1.0), ("fromCodePoint", 1.0)] {
             let function = self.alloc_native(
@@ -503,7 +522,7 @@ impl Engine {
             );
             self.set_property(function, "name", Value::String(method_name.to_owned()));
             self.set_property(function, "length", Value::Number(0.0));
-            self.set_property(prototype, method_name, Value::Object(function));
+            self.set_builtin_property(prototype, method_name, Value::Object(function));
         }
         for (name, arity) in [
             ("isFinite", 1.0),
@@ -634,6 +653,9 @@ impl Engine {
         self.objects[array]
             .properties
             .insert("length".to_owned(), Value::Number(0.0));
+        self.objects[array]
+            .non_enumerable
+            .insert("length".to_owned());
         array
     }
 
@@ -1189,6 +1211,42 @@ impl Engine {
                 }
                 Ok(Completion::Normal(result))
             }
+            Stmt::ForEach {
+                name,
+                kind,
+                iterable,
+                body,
+                is_of,
+            } => {
+                let iterable = self.evaluate(iterable, scope)?;
+                let values = self.for_each_values(iterable, *is_of)?;
+                let mut result = Value::Undefined;
+                for value in values {
+                    let iteration_scope = if *kind == DeclarationKind::Var {
+                        let target = self.var_scope(scope);
+                        self.assign_binding(target, name, value, 1, 1)?;
+                        scope
+                    } else {
+                        let iteration_scope = self.new_scope(scope);
+                        self.declare(
+                            iteration_scope,
+                            name,
+                            value,
+                            *kind == DeclarationKind::Let,
+                            1,
+                            1,
+                        )?;
+                        iteration_scope
+                    };
+                    match self.execute_statement(body, iteration_scope)? {
+                        Completion::Normal(value) => result = value,
+                        completion @ Completion::Return(_) => return Ok(completion),
+                        Completion::Break => break,
+                        Completion::Continue => {}
+                    }
+                }
+                Ok(Completion::Normal(result))
+            }
             Stmt::DoWhile { body, condition } => {
                 let mut result = Value::Undefined;
                 loop {
@@ -1274,27 +1332,51 @@ impl Engine {
             Expr::Assignment {
                 target,
                 value,
-                line,
-                column,
+                operator,
+                ..
             } => {
-                let value = self.evaluate(value, scope)?;
-                match target.as_ref() {
-                    Expr::Identifier { name, .. } => {
-                        self.assign_binding(scope, name, value, *line, *column)
-                    }
-                    Expr::Member(object, property) => {
-                        let object = self.evaluate(object, scope)?;
-                        self.set_property_value(object, property, value.clone(), *line, *column)?;
-                        Ok(value)
-                    }
-                    Expr::Index(object, property) => {
-                        let object = self.evaluate(object, scope)?;
-                        let property = self.evaluate(property, scope)?.to_js_string();
-                        self.set_property_value(object, &property, value.clone(), *line, *column)?;
-                        Ok(value)
-                    }
-                    _ => unreachable!("parser validates assignment targets"),
+                let reference = self.evaluate_reference(target, scope)?;
+                let current = if operator.is_some() {
+                    Some(self.read_reference(&reference)?)
+                } else {
+                    None
+                };
+                if let (Some(operator), Some(current)) = (operator, current.as_ref())
+                    && ((*operator == BinaryOp::And && !current.is_truthy())
+                        || (*operator == BinaryOp::Or && current.is_truthy())
+                        || (*operator == BinaryOp::Nullish
+                            && !matches!(current, Value::Null | Value::Undefined)))
+                {
+                    return Ok(current.clone());
                 }
+                let mut value = self.evaluate(value, scope)?;
+                if let (Some(operator), Some(current)) = (operator, current) {
+                    value = self.evaluate_binary(*operator, current, value)?;
+                }
+                self.write_reference(reference, value)
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                if self.evaluate(test, scope)?.is_truthy() {
+                    self.evaluate(consequent, scope)
+                } else {
+                    self.evaluate(alternate, scope)
+                }
+            }
+            Expr::Update {
+                target,
+                increment,
+                prefix,
+            } => {
+                let reference = self.evaluate_reference(target, scope)?;
+                let previous = self.read_reference(&reference)?;
+                let next =
+                    Value::Number(previous.to_number() + if *increment { 1.0 } else { -1.0 });
+                self.write_reference(reference, next.clone())?;
+                Ok(if *prefix { next } else { previous })
             }
             Expr::Unary {
                 operator,
@@ -1316,6 +1398,9 @@ impl Engine {
                     UnaryOp::Not => Ok(Value::Boolean(!operand.is_truthy())),
                     UnaryOp::Plus => Ok(Value::Number(operand.to_number())),
                     UnaryOp::Minus => Ok(Value::Number(-operand.to_number())),
+                    UnaryOp::BitNot => Ok(Value::Number(
+                        (!to_uint32(operand.to_number()) as i32) as f64,
+                    )),
                     UnaryOp::TypeOf => Ok(Value::String(
                         match operand {
                             Value::Undefined => "undefined",
@@ -1462,6 +1547,137 @@ impl Engine {
         }
     }
 
+    fn evaluate_reference(
+        &mut self,
+        expression: &Expr,
+        scope: ScopeId,
+    ) -> Result<Reference, EngineError> {
+        match expression {
+            Expr::Identifier { name, line, column } => Ok(Reference::Binding {
+                scope,
+                name: name.clone(),
+                line: *line,
+                column: *column,
+            }),
+            Expr::Member(object, property) => Ok(Reference::Property {
+                base: self.evaluate(object, scope)?,
+                name: property.clone(),
+                line: 1,
+                column: 1,
+            }),
+            Expr::Index(object, property) => {
+                let base = self.evaluate(object, scope)?;
+                let name = self.evaluate(property, scope)?.to_js_string();
+                Ok(Reference::Property {
+                    base,
+                    name,
+                    line: 1,
+                    column: 1,
+                })
+            }
+            _ => unreachable!("parser validates reference targets"),
+        }
+    }
+
+    fn for_each_values(&self, iterable: Value, is_of: bool) -> Result<Vec<Value>, EngineError> {
+        if is_of {
+            return match iterable {
+                Value::Object(id) if self.objects[id].is_array => Ok((0..self.array_length(id))
+                    .map(|index| {
+                        self.get_property(id, &index.to_string())
+                            .unwrap_or(Value::Undefined)
+                    })
+                    .collect()),
+                Value::String(value) => Ok(value
+                    .chars()
+                    .map(|character| Value::String(character.to_string()))
+                    .collect()),
+                _ => Err(EngineError::new(
+                    "TypeError",
+                    "Value is not iterable by this runtime",
+                    1,
+                    1,
+                )),
+            };
+        }
+        match iterable {
+            Value::Object(id) => {
+                let mut keys = Vec::new();
+                let mut seen = HashSet::new();
+                let mut current = Some(id);
+                while let Some(object) = current {
+                    for name in self.enumerable_property_names(object) {
+                        if seen.insert(name.clone()) {
+                            keys.push(Value::String(name));
+                        }
+                    }
+                    current = self.objects[object].prototype;
+                }
+                Ok(keys)
+            }
+            Value::String(value) => Ok((0..value.encode_utf16().count())
+                .map(|index| Value::String(index.to_string()))
+                .collect()),
+            Value::Null | Value::Undefined => Err(EngineError::new(
+                "TypeError",
+                "Cannot enumerate null or undefined",
+                1,
+                1,
+            )),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn read_reference(&self, reference: &Reference) -> Result<Value, EngineError> {
+        match reference {
+            Reference::Binding {
+                scope,
+                name,
+                line,
+                column,
+            } => self
+                .get_binding(*scope, name, *line, *column)?
+                .ok_or_else(|| {
+                    EngineError::new(
+                        "ReferenceError",
+                        format!("{name} is not defined"),
+                        *line,
+                        *column,
+                    )
+                }),
+            Reference::Property {
+                base,
+                name,
+                line,
+                column,
+            } => self.get_property_value(base.clone(), name, *line, *column),
+        }
+    }
+
+    fn write_reference(
+        &mut self,
+        reference: Reference,
+        value: Value,
+    ) -> Result<Value, EngineError> {
+        match reference {
+            Reference::Binding {
+                scope,
+                name,
+                line,
+                column,
+            } => self.assign_binding(scope, &name, value, line, column),
+            Reference::Property {
+                base,
+                name,
+                line,
+                column,
+            } => {
+                self.set_property_value(base, &name, value.clone(), line, column)?;
+                Ok(value)
+            }
+        }
+    }
+
     fn evaluate_binary(
         &self,
         operator: BinaryOp,
@@ -1488,6 +1704,27 @@ impl Engine {
             BinaryOp::Multiply => number(left.to_number() * right.to_number()),
             BinaryOp::Divide => number(left.to_number() / right.to_number()),
             BinaryOp::Remainder => number(left.to_number() % right.to_number()),
+            BinaryOp::Exponent => number(left.to_number().powf(right.to_number())),
+            BinaryOp::BitAnd => {
+                number((to_uint32(left.to_number()) & to_uint32(right.to_number())) as i32 as f64)
+            }
+            BinaryOp::BitOr => {
+                number((to_uint32(left.to_number()) | to_uint32(right.to_number())) as i32 as f64)
+            }
+            BinaryOp::BitXor => {
+                number((to_uint32(left.to_number()) ^ to_uint32(right.to_number())) as i32 as f64)
+            }
+            BinaryOp::ShiftLeft => number(
+                ((to_uint32(left.to_number()) as i32) << (to_uint32(right.to_number()) & 31))
+                    as f64,
+            ),
+            BinaryOp::ShiftRight => number(
+                ((to_uint32(left.to_number()) as i32) >> (to_uint32(right.to_number()) & 31))
+                    as f64,
+            ),
+            BinaryOp::UnsignedShiftRight => {
+                number((to_uint32(left.to_number()) >> (to_uint32(right.to_number()) & 31)) as f64)
+            }
             BinaryOp::StrictEqual => boolean(self.strict_equal(&left, &right)),
             BinaryOp::StrictNotEqual => boolean(!self.strict_equal(&left, &right)),
             BinaryOp::Equal | BinaryOp::NotEqual => {
@@ -1691,6 +1928,11 @@ impl Engine {
                     .insert("length".to_owned(), Value::Number(f64::from(index) + 1.0));
             }
         }
+    }
+
+    fn set_builtin_property(&mut self, object: ObjectId, name: &str, value: Value) {
+        self.set_property(object, name, value);
+        self.objects[object].non_enumerable.insert(name.to_owned());
     }
 
     fn remove_property(&mut self, object: ObjectId, name: &str) {
@@ -2941,7 +3183,8 @@ impl Engine {
                     .unwrap_or_else(|| "undefined".to_owned());
                 Ok(Value::Boolean(
                     self.get_own_property(object, &name).is_some()
-                        && (method != "propertyIsEnumerable" || name != "length"),
+                        && (method != "propertyIsEnumerable"
+                            || !self.objects[object].non_enumerable.contains(&name)),
                 ))
             }
             "toString" => match this_value {
@@ -2994,10 +3237,11 @@ impl Engine {
                         1,
                     ));
                 };
-                let mut names = self.own_property_names(*id);
-                if method == "getOwnPropertyNames" && self.objects[*id].is_array {
-                    names.push("length".to_owned());
-                }
+                let names = if method == "getOwnPropertyNames" {
+                    self.own_property_names(*id)
+                } else {
+                    self.enumerable_property_names(*id)
+                };
                 let result = self.alloc_array();
                 for (index, name) in names.into_iter().enumerate() {
                     let value = self
@@ -3028,7 +3272,7 @@ impl Engine {
                 };
                 for source in arguments.iter().skip(1) {
                     if let Value::Object(source) = source {
-                        for name in self.own_property_names(*source) {
+                        for name in self.enumerable_property_names(*source) {
                             if let Some(value) = self.get_own_property(*source, &name) {
                                 self.set_property(*target, &name, value);
                             }
@@ -3085,14 +3329,11 @@ impl Engine {
         let mut ordered: Vec<String> = properties
             .property_order
             .iter()
-            .filter(|name| {
-                properties.properties.contains_key(*name)
-                    && !(properties.is_array && name.as_str() == "length")
-            })
+            .filter(|name| properties.properties.contains_key(*name))
             .cloned()
             .collect();
         for name in properties.properties.keys() {
-            if !ordered.contains(name) && !(properties.is_array && name.as_str() == "length") {
+            if !ordered.contains(name) {
                 ordered.push(name.clone());
             }
         }
@@ -3110,6 +3351,13 @@ impl Engine {
             .into_iter()
             .map(|(_, name)| name)
             .chain(strings)
+            .collect()
+    }
+
+    fn enumerable_property_names(&self, object: ObjectId) -> Vec<String> {
+        self.own_property_names(object)
+            .into_iter()
+            .filter(|name| !self.objects[object].non_enumerable.contains(name))
             .collect()
     }
 
@@ -3151,7 +3399,7 @@ impl Engine {
                     format!("[{}]", parts.join(","))
                 } else {
                     let mut parts = Vec::new();
-                    for key in self.own_property_names(*id) {
+                    for key in self.enumerable_property_names(*id) {
                         let item = self.get_own_property(*id, &key).unwrap_or(Value::Undefined);
                         if let Some(serialized) = self.json_stringify(&item, ancestors)? {
                             parts.push(format!("{}:{serialized}", json_quote(&key)));
@@ -3766,6 +4014,18 @@ fn collect_var_names(statements: &[Stmt], names: &mut Vec<String>) {
                 }
                 collect_var_names(std::slice::from_ref(body), names);
             }
+            Stmt::ForEach {
+                name,
+                kind: DeclarationKind::Var,
+                body,
+                ..
+            } => {
+                names.push(name.clone());
+                collect_var_names(std::slice::from_ref(body), names);
+            }
+            Stmt::ForEach { body, .. } => {
+                collect_var_names(std::slice::from_ref(body), names);
+            }
             Stmt::DoWhile { body, .. } => collect_var_names(std::slice::from_ref(body), names),
             Stmt::Try {
                 body,
@@ -4247,6 +4507,14 @@ mod tests {
         );
         assert_eq!(
             engine
+                .eval_to_string(
+                    "Object.keys([1]).join(',') + ':' + Object.keys({ a: 1 }).join(',')"
+                )
+                .unwrap(),
+            "0:a"
+        );
+        assert_eq!(
+            engine
                 .eval("let circular = []; circular.push(circular); JSON.stringify(circular)")
                 .unwrap_err()
                 .name,
@@ -4283,6 +4551,92 @@ mod tests {
         assert_eq!(
             engine.eval("JSON.parse('{invalid}')").unwrap_err().name,
             "SyntaxError"
+        );
+    }
+
+    #[test]
+    fn core_expression_operators_follow_precedence_and_short_circuiting() {
+        let mut engine = Engine::new();
+        assert_eq!(engine.eval_to_string("2 ** 3 ** 2").unwrap(), "512");
+        assert_eq!(
+            engine
+                .eval_to_string("(5 & 3) + (8 >> 1) + (1 << 2) + (8 >>> 1)")
+                .unwrap(),
+            "13"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let count = 0; let chosen = true ? ++count : ++count; chosen + count"
+                )
+                .unwrap(),
+            "2"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("let total = 4; total += 3; total *= 2; total **= 2; total",)
+                .unwrap(),
+            "196"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("let maybe = null; maybe ??= 'ready'; maybe")
+                .unwrap(),
+            "ready"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("let flag = false; flag ||= true; flag &&= true; flag")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let calls = 0; let values = [10]; values[++calls] = 4; calls + values.length",
+                )
+                .unwrap(),
+            "3"
+        );
+        assert_eq!(engine.eval_to_string("let n = 1; n++ + ++n").unwrap(), "4");
+    }
+
+    #[test]
+    fn for_in_and_for_of_iterate_supported_values_with_fresh_lexical_bindings() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string("let sum = 0; for (const value of [2, 3, 4]) sum += value; sum")
+                .unwrap(),
+            "9"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let names = ''; for (let key in { first: 1, second: 2 }) names += key + ','; names",
+                )
+                .unwrap(),
+            "first,second,"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let chars = ''; for (let character of 'hi') chars += character; chars"
+                )
+                .unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let saved = []; for (let value of [4, 9]) { if (value === 4) saved[0] = function() { return value; }; else saved[1] = function() { return value; }; } saved[0]() + saved[1]()",
+                )
+                .unwrap(),
+            "13"
+        );
+        assert_eq!(
+            engine.eval("for (let value of 1) {}").unwrap_err().name,
+            "TypeError"
         );
     }
 }

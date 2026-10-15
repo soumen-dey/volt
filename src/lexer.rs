@@ -77,7 +77,7 @@ impl<'a> Lexer<'a> {
                     TokenKind::Identifier(self.read_identifier())
                 }
                 b'+' | b'-' | b'*' | b'/' | b'%' | b'!' | b'=' | b'<' | b'>' | b'&' | b'|'
-                | b'?' => TokenKind::Operator(self.read_operator(line, column)?),
+                | b'?' | b'^' | b'~' => TokenKind::Operator(self.read_operator(line, column)?),
                 _ => {
                     return Err(EngineError::new(
                         "SyntaxError",
@@ -234,10 +234,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_operator(&mut self, line: usize, column: usize) -> Result<String, EngineError> {
-        const OPERATORS: [&str; 14] = [
-            "===", "!==", "==", "!=", "<=", ">=", "&&", "||", "??", "+", "-", "*", "/", "%",
+        const OPERATORS: [&str; 30] = [
+            ">>>=", "===", "!==", "&&=", "||=", "??=", "**=", ">>>", ">>=", "<<=", "**", "==",
+            "!=", "<=", ">=", "&&", "||", "??", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=",
+            "|=", "^=", "<<", ">>",
         ];
-        const OTHER: [&str; 4] = ["=", "<", ">", "!"];
+        const OTHER: [&str; 10] = ["=", "<", ">", "!", "+", "-", "*", "&", "|", "?"];
         for operator in OPERATORS.iter().chain(OTHER.iter()) {
             if self.source[self.offset..].starts_with(operator) {
                 for _ in operator.bytes() {

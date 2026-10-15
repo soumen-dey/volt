@@ -16,11 +16,13 @@ The interpreter currently supports:
 - `undefined`, `null`, booleans, decimal numbers, and single-/double-quoted strings
 - `let` and `const` block bindings, function/global-scoped `var`, declaration
   hoisting, lexical TDZ checks, and function declarations
-- arithmetic, comparison, equality, logical, and nullish-coalescing operators
-- assignment to identifiers and object properties
-- unary `!`, `+`, `-`, `typeof`, and `void`
+- arithmetic, exponentiation, bitwise, shift, comparison, equality, logical,
+  nullish-coalescing, and conditional operators
+- simple and selected compound assignments, prefix/postfix increment and
+  decrement, and assignment to identifiers and object properties
+- unary `!`, `+`, `-`, `~`, `typeof`, `void`, and `delete`
 - blocks, `if`/`else`, `while`, `do...while`, C-style `for`, `break`, and
-  `continue`
+  `continue`, plus array/string `for...of` and object `for...in`
 - strict-mode directives and selected strict-mode early/runtime errors
 - function declarations and expressions, parameters, return, closures,
   function names/length, `arguments`, and strict/sloppy direct-call `this`
