@@ -41,6 +41,8 @@ The interpreter currently supports:
 - basic insertion-ordered `Map` and `Set` storage, core lookup and mutation
   methods, `forEach`, mutation-aware `keys()`, `values()`, and `entries()`
   iterators, and iteration in `for...of` and `Array.from`
+- basic `WeakMap` and `WeakSet` construction and object-keyed lookup/mutation
+  methods
 - selected `String`, `Number`, and `Boolean` conversions and prototype methods,
   `Math`, global numeric conversion helpers, and `JSON.parse`/`JSON.stringify`
   with reviver, replacer, and indentation arguments
@@ -60,6 +62,9 @@ their methods, but the `Symbol.iterator` protocol and generic iterable
 consumption are not implemented; `for...of` and `Array.from` recognize only
 the runtime's supported built-in input types. Collection iteration handles
 basic additions and deletions, but the full collection API is not complete.
+`WeakMap` and `WeakSet` enforce object-key requirements but do not provide
+garbage-collection weak-reference behavior because the runtime has no garbage
+collector.
 Some array methods,
 complete string/number behavior, `Date`, `RegExp`, `Symbol`, `BigInt`, `Proxy`,
 `Reflect`, modules, promises/jobs, and many other specified APIs are not implemented.

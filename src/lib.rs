@@ -138,6 +138,10 @@ enum NativeFunction {
     SetConstructor,
     SetMethod(&'static str),
     SetIteratorMethod(&'static str),
+    WeakMapConstructor,
+    WeakMapMethod(&'static str),
+    WeakSetConstructor,
+    WeakSetMethod(&'static str),
     String,
     StringMethod(&'static str),
     Number,
@@ -174,6 +178,8 @@ struct Object {
     collection_iterator: Option<CollectionIterator>,
     map_data: Option<Vec<Option<(Value, Value)>>>,
     set_data: Option<Vec<Option<Value>>>,
+    weak_map_data: Option<Vec<(ObjectId, Value)>>,
+    weak_set_data: Option<Vec<ObjectId>>,
 }
 
 #[derive(Clone)]
@@ -244,6 +250,8 @@ pub struct Engine {
     collection_iterator_prototype: ObjectId,
     map_prototype: ObjectId,
     set_prototype: ObjectId,
+    weak_map_prototype: ObjectId,
+    weak_set_prototype: ObjectId,
     string_prototype: ObjectId,
     number_prototype: ObjectId,
     boolean_prototype: ObjectId,
@@ -268,6 +276,8 @@ impl Engine {
             collection_iterator_prototype: 0,
             map_prototype: 0,
             set_prototype: 0,
+            weak_map_prototype: 0,
+            weak_set_prototype: 0,
             string_prototype: 0,
             number_prototype: 0,
             boolean_prototype: 0,
@@ -286,6 +296,8 @@ impl Engine {
         engine.collection_iterator_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.map_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.set_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.weak_map_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.weak_set_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.string_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.number_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.boolean_prototype = engine.alloc_object(Some(engine.object_prototype));
@@ -568,6 +580,57 @@ impl Engine {
             false,
         );
         self.declare_global("Set", Value::Object(set), false);
+
+        let weak_map = self.alloc_native(
+            NativeFunction::WeakMapConstructor,
+            Some(self.object_prototype),
+        );
+        self.install_weak_collection_prototype(
+            weak_map,
+            "WeakMap",
+            self.weak_map_prototype,
+            &[("set", 2.0), ("get", 1.0), ("has", 1.0), ("delete", 1.0)],
+            true,
+        );
+        self.declare_global("WeakMap", Value::Object(weak_map), false);
+
+        let weak_set = self.alloc_native(
+            NativeFunction::WeakSetConstructor,
+            Some(self.object_prototype),
+        );
+        self.install_weak_collection_prototype(
+            weak_set,
+            "WeakSet",
+            self.weak_set_prototype,
+            &[("add", 1.0), ("has", 1.0), ("delete", 1.0)],
+            false,
+        );
+        self.declare_global("WeakSet", Value::Object(weak_set), false);
+    }
+
+    fn install_weak_collection_prototype(
+        &mut self,
+        constructor: ObjectId,
+        name: &str,
+        prototype: ObjectId,
+        methods: &[(&'static str, f64)],
+        is_map: bool,
+    ) {
+        self.set_property(constructor, "name", Value::String(name.to_owned()));
+        self.set_property(constructor, "length", Value::Number(0.0));
+        self.set_property(constructor, "prototype", Value::Object(prototype));
+        self.set_builtin_property(prototype, "constructor", Value::Object(constructor));
+        for (method, length) in methods {
+            let native = if is_map {
+                NativeFunction::WeakMapMethod(method)
+            } else {
+                NativeFunction::WeakSetMethod(method)
+            };
+            let function = self.alloc_native(native, Some(self.object_prototype));
+            self.set_property(function, "name", Value::String((*method).to_owned()));
+            self.set_property(function, "length", Value::Number(*length));
+            self.set_builtin_property(prototype, method, Value::Object(function));
+        }
     }
 
     fn install_collection_prototype(
@@ -2532,6 +2595,8 @@ impl Engine {
                         | NativeFunction::Boolean
                         | NativeFunction::MapConstructor
                         | NativeFunction::SetConstructor
+                        | NativeFunction::WeakMapConstructor
+                        | NativeFunction::WeakSetConstructor
                 ))
         )
     }
@@ -3053,6 +3118,103 @@ impl Engine {
             }
             NativeFunction::SetIteratorMethod(kind) => {
                 self.call_collection_iterator_method(kind, this_value, false)
+            }
+            NativeFunction::WeakMapConstructor => {
+                let Value::Object(weak_map) = this_value else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "WeakMap constructor must be called with new",
+                        1,
+                        1,
+                    ));
+                };
+                self.objects[weak_map].weak_map_data = Some(Vec::new());
+                if let Some(Value::Object(iterable)) = arguments.first()
+                    && self.objects[*iterable].is_array
+                {
+                    for index in 0..self.array_length(*iterable) {
+                        let entry = self
+                            .get_property(*iterable, &index.to_string())
+                            .unwrap_or(Value::Undefined);
+                        let Value::Object(pair) = entry else {
+                            return Err(EngineError::new(
+                                "TypeError",
+                                "WeakMap entries must be objects",
+                                1,
+                                1,
+                            ));
+                        };
+                        let Value::Object(key) =
+                            self.get_property(pair, "0").unwrap_or(Value::Undefined)
+                        else {
+                            return Err(EngineError::new(
+                                "TypeError",
+                                "WeakMap keys must be objects",
+                                1,
+                                1,
+                            ));
+                        };
+                        let value = self.get_property(pair, "1").unwrap_or(Value::Undefined);
+                        self.weak_map_set(weak_map, key, value);
+                    }
+                } else if arguments
+                    .first()
+                    .is_some_and(|value| !matches!(value, Value::Undefined | Value::Null))
+                {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "WeakMap constructor argument is not iterable",
+                        1,
+                        1,
+                    ));
+                }
+                Ok(Value::Object(weak_map))
+            }
+            NativeFunction::WeakMapMethod(method) => {
+                self.call_weak_map_method(method, this_value, arguments)
+            }
+            NativeFunction::WeakSetConstructor => {
+                let Value::Object(weak_set) = this_value else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "WeakSet constructor must be called with new",
+                        1,
+                        1,
+                    ));
+                };
+                self.objects[weak_set].weak_set_data = Some(Vec::new());
+                if let Some(Value::Object(iterable)) = arguments.first()
+                    && self.objects[*iterable].is_array
+                {
+                    for index in 0..self.array_length(*iterable) {
+                        let value = self
+                            .get_property(*iterable, &index.to_string())
+                            .unwrap_or(Value::Undefined);
+                        let Value::Object(value) = value else {
+                            return Err(EngineError::new(
+                                "TypeError",
+                                "WeakSet values must be objects",
+                                1,
+                                1,
+                            ));
+                        };
+                        self.weak_set_add(weak_set, value);
+                    }
+                } else if arguments
+                    .first()
+                    .is_some_and(|value| !matches!(value, Value::Undefined | Value::Null))
+                {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "WeakSet constructor argument is not iterable",
+                        1,
+                        1,
+                    ));
+                }
+                Ok(Value::Object(weak_set))
+            }
+            NativeFunction::WeakSetMethod(method) => {
+                self.call_weak_set_method(method, this_value, arguments)
             }
             NativeFunction::String => Ok(Value::String(
                 arguments
@@ -3857,6 +4019,167 @@ impl Engine {
                 ))
             }
             _ => unreachable!("known Set method"),
+        }
+    }
+
+    fn weak_map_set(&mut self, weak_map: ObjectId, key: ObjectId, value: Value) {
+        let entries = self.objects[weak_map]
+            .weak_map_data
+            .as_mut()
+            .expect("WeakMap internal data is initialized");
+        if let Some((_, stored_value)) = entries
+            .iter_mut()
+            .find(|(stored_key, _)| *stored_key == key)
+        {
+            *stored_value = value;
+        } else {
+            entries.push((key, value));
+        }
+    }
+
+    fn weak_set_add(&mut self, weak_set: ObjectId, value: ObjectId) {
+        let values = self.objects[weak_set]
+            .weak_set_data
+            .as_mut()
+            .expect("WeakSet internal data is initialized");
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+
+    fn call_weak_map_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        let Value::Object(weak_map) = this_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "WeakMap method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        if self.objects[weak_map].weak_map_data.is_none() {
+            return Err(EngineError::new(
+                "TypeError",
+                "WeakMap method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        }
+        let key = arguments.first().cloned().unwrap_or(Value::Undefined);
+        match method {
+            "set" => {
+                let Value::Object(key) = key else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "WeakMap keys must be objects",
+                        1,
+                        1,
+                    ));
+                };
+                self.weak_map_set(
+                    weak_map,
+                    key,
+                    arguments.get(1).cloned().unwrap_or(Value::Undefined),
+                );
+                Ok(Value::Object(weak_map))
+            }
+            "get" => Ok(match key {
+                Value::Object(key) => self.objects[weak_map]
+                    .weak_map_data
+                    .as_ref()
+                    .expect("WeakMap internal data is initialized")
+                    .iter()
+                    .find(|(stored_key, _)| *stored_key == key)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(Value::Undefined),
+                _ => Value::Undefined,
+            }),
+            "has" => Ok(Value::Boolean(match key {
+                Value::Object(key) => self.objects[weak_map]
+                    .weak_map_data
+                    .as_ref()
+                    .expect("WeakMap internal data is initialized")
+                    .iter()
+                    .any(|(stored_key, _)| *stored_key == key),
+                _ => false,
+            })),
+            "delete" => {
+                let Value::Object(key) = key else {
+                    return Ok(Value::Boolean(false));
+                };
+                let entries = self.objects[weak_map]
+                    .weak_map_data
+                    .as_mut()
+                    .expect("WeakMap internal data is initialized");
+                let old_length = entries.len();
+                entries.retain(|(stored_key, _)| *stored_key != key);
+                Ok(Value::Boolean(entries.len() != old_length))
+            }
+            _ => unreachable!("known WeakMap method"),
+        }
+    }
+
+    fn call_weak_set_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        let Value::Object(weak_set) = this_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "WeakSet method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        if self.objects[weak_set].weak_set_data.is_none() {
+            return Err(EngineError::new(
+                "TypeError",
+                "WeakSet method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        }
+        let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+        match method {
+            "add" => {
+                let Value::Object(value) = value else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "WeakSet values must be objects",
+                        1,
+                        1,
+                    ));
+                };
+                self.weak_set_add(weak_set, value);
+                Ok(Value::Object(weak_set))
+            }
+            "has" => Ok(Value::Boolean(match value {
+                Value::Object(value) => self.objects[weak_set]
+                    .weak_set_data
+                    .as_ref()
+                    .expect("WeakSet internal data is initialized")
+                    .contains(&value),
+                _ => false,
+            })),
+            "delete" => {
+                let Value::Object(value) = value else {
+                    return Ok(Value::Boolean(false));
+                };
+                let values = self.objects[weak_set]
+                    .weak_set_data
+                    .as_mut()
+                    .expect("WeakSet internal data is initialized");
+                let old_length = values.len();
+                values.retain(|stored_value| *stored_value != value);
+                Ok(Value::Boolean(values.len() != old_length))
+            }
+            _ => unreachable!("known WeakSet method"),
         }
     }
 
@@ -6437,6 +6760,43 @@ mod tests {
         assert_eq!(engine.eval("new Map([1])").unwrap_err().name, "TypeError");
         assert_eq!(engine.eval("new Map({})").unwrap_err().name, "TypeError");
         assert_eq!(engine.eval("new Set({})").unwrap_err().name, "TypeError");
+    }
+
+    #[test]
+    fn weak_collections_enforce_object_keys_and_support_basic_operations() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let weakMapKey = {}; let weakMap = new WeakMap([[weakMapKey, 3]]); weakMap.set(weakMapKey, 4); weakMap.get(weakMapKey) + ':' + weakMap.has(weakMapKey) + ':' + weakMap.has(1) + ':' + weakMap.get(1) + ':' + weakMap.delete(weakMapKey) + ':' + weakMap.has(weakMapKey)",
+                )
+                .unwrap(),
+            "4:true:false:undefined:true:false"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let weakSetKey = {}; let weakSet = new WeakSet([weakSetKey, weakSetKey]); weakSet.add(weakSetKey) === weakSet && weakSet.has(weakSetKey) && !weakSet.has(1) && weakSet.delete(weakSetKey) && !weakSet.has(weakSetKey)",
+                )
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            engine.eval("new WeakMap([[1, 2]])").unwrap_err().name,
+            "TypeError"
+        );
+        assert_eq!(
+            engine.eval("new WeakSet([1])").unwrap_err().name,
+            "TypeError"
+        );
+        assert_eq!(
+            engine.eval("new WeakMap().set(1, 2)").unwrap_err().name,
+            "TypeError"
+        );
+        assert_eq!(
+            engine.eval("new WeakSet().add(1)").unwrap_err().name,
+            "TypeError"
+        );
     }
 
     #[test]
