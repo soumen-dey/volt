@@ -2726,7 +2726,17 @@ impl Engine {
                         .map(|value| self.to_string(value))
                         .unwrap_or_else(|| "undefined".to_owned());
                     let mut parser = JsonParser::new(&input);
-                    parser.parse_value(self)
+                    let value = parser.parse_value(self)?;
+                    let reviver = arguments.get(1).cloned().filter(
+                        |value| matches!(value, Value::Object(id) if self.objects[*id].function.is_some()),
+                    );
+                    if let Some(reviver) = reviver {
+                        let root = self.alloc_object(Some(self.object_prototype));
+                        self.set_property(root, "", value);
+                        self.json_internalize(root, "", &reviver)
+                    } else {
+                        Ok(value)
+                    }
                 }
                 _ => Ok(Value::Undefined),
             },
@@ -4075,6 +4085,37 @@ impl Engine {
         Ok(serialized.map(Value::String).unwrap_or(Value::Undefined))
     }
 
+    fn json_internalize(
+        &mut self,
+        holder: ObjectId,
+        key: &str,
+        reviver: &Value,
+    ) -> Result<Value, EngineError> {
+        let value = self.get_property_with_receiver(holder, Value::Object(holder), key)?;
+        if let Value::Object(object) = value.clone() {
+            let keys = if self.objects[object].is_array {
+                (0..self.array_length(object))
+                    .map(|index| index.to_string())
+                    .collect()
+            } else {
+                self.own_property_names(object)
+            };
+            for child_key in keys {
+                let revived = self.json_internalize(object, &child_key, reviver)?;
+                if matches!(revived, Value::Undefined) {
+                    self.remove_property(object, &child_key);
+                } else {
+                    self.set_property(object, &child_key, revived);
+                }
+            }
+        }
+        self.call(
+            reviver.clone(),
+            Value::Object(holder),
+            vec![Value::String(key.to_owned()), value],
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn json_stringify_property(
         &mut self,
@@ -5298,6 +5339,14 @@ mod tests {
                 "let decoded = JSON.parse('{\"items\":[1,true,null],\"text\":\"ok\"}'); JSON.stringify(decoded)",
             ).unwrap(),
             "{\"items\":[1,true,null],\"text\":\"ok\"}"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let visited = ''; let revived = JSON.parse('{\"items\":[1,2],\"drop\":3}', function(key, value) { visited += key + ','; if (key === '0' || key === 'drop') return undefined; return value; }); visited + ':' + JSON.stringify(revived)",
+                )
+                .unwrap(),
+            "0,1,items,drop,,:{\"items\":[null,2]}"
         );
         assert_eq!(
             engine
