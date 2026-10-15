@@ -3025,6 +3025,12 @@ impl Engine {
                 };
                 self.objects[map].map_data = Some(Vec::new());
                 if let Some(Value::Object(iterable)) = arguments.first()
+                    && self.is_iterator_object(*iterable)
+                {
+                    for entry in self.iterator_to_list(*iterable)? {
+                        self.map_insert_entry(map, entry)?;
+                    }
+                } else if let Some(Value::Object(iterable)) = arguments.first()
                     && let Some(entries) = self.objects[*iterable].map_data.clone()
                 {
                     self.objects[map].map_data =
@@ -3078,6 +3084,12 @@ impl Engine {
                 };
                 self.objects[set].set_data = Some(Vec::new());
                 if let Some(Value::Object(iterable)) = arguments.first()
+                    && self.is_iterator_object(*iterable)
+                {
+                    for value in self.iterator_to_list(*iterable)? {
+                        self.set_add(set, value);
+                    }
+                } else if let Some(Value::Object(iterable)) = arguments.first()
                     && let Some(values) = self.objects[*iterable].set_data.clone()
                 {
                     self.objects[set].set_data =
@@ -3703,6 +3715,63 @@ impl Engine {
         }
     }
 
+    fn is_iterator_object(&self, object: ObjectId) -> bool {
+        self.objects[object].array_iterator.is_some()
+            || self.objects[object].collection_iterator.is_some()
+    }
+
+    fn iterator_to_list(&mut self, iterator: ObjectId) -> Result<Vec<Value>, EngineError> {
+        let next = self
+            .get_property(iterator, "next")
+            .unwrap_or(Value::Undefined);
+        let mut values = Vec::new();
+        loop {
+            let Value::Object(result) =
+                self.call(next.clone(), Value::Object(iterator), Vec::new())?
+            else {
+                return Err(EngineError::new(
+                    "TypeError",
+                    "Iterator next() did not return an object",
+                    1,
+                    1,
+                ));
+            };
+            if self
+                .get_property(result, "done")
+                .is_some_and(|done| done.is_truthy())
+            {
+                return Ok(values);
+            }
+            values.push(
+                self.get_property(result, "value")
+                    .unwrap_or(Value::Undefined),
+            );
+            if values.len() >= 1_000_000 {
+                return Err(EngineError::new(
+                    "RangeError",
+                    "Iterator produced too many values",
+                    1,
+                    1,
+                ));
+            }
+        }
+    }
+
+    fn map_insert_entry(&mut self, map: ObjectId, entry: Value) -> Result<(), EngineError> {
+        let Value::Object(entry) = entry else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Map entries must be objects",
+                1,
+                1,
+            ));
+        };
+        let key = self.get_property(entry, "0").unwrap_or(Value::Undefined);
+        let value = self.get_property(entry, "1").unwrap_or(Value::Undefined);
+        self.map_set(map, key, value);
+        Ok(())
+    }
+
     fn set_add(&mut self, set: ObjectId, value: Value) {
         let values = self.objects[set]
             .set_data
@@ -4234,6 +4303,9 @@ impl Engine {
         }
         if method == "from" {
             let mut values = match arguments.first() {
+                Some(Value::Object(id)) if self.is_iterator_object(*id) => {
+                    self.iterator_to_list(*id)?.into_iter().map(Some).collect()
+                }
                 Some(Value::Object(id)) if self.objects[*id].is_array => self
                     .array_iterator_values(*id)?
                     .into_iter()
@@ -4760,41 +4832,7 @@ impl Engine {
 
     fn array_iterator_values(&mut self, array: ObjectId) -> Result<Vec<Value>, EngineError> {
         let iterator = self.alloc_array_iterator(array, "values");
-        let next = self
-            .get_property(iterator, "next")
-            .unwrap_or(Value::Undefined);
-        let mut values = Vec::new();
-        loop {
-            let Value::Object(result) =
-                self.call(next.clone(), Value::Object(iterator), Vec::new())?
-            else {
-                return Err(EngineError::new(
-                    "TypeError",
-                    "Iterator next() did not return an object",
-                    1,
-                    1,
-                ));
-            };
-            if self
-                .get_property(result, "done")
-                .is_some_and(|done| done.is_truthy())
-            {
-                break;
-            }
-            values.push(
-                self.get_property(result, "value")
-                    .unwrap_or(Value::Undefined),
-            );
-            if values.len() > 1_000_000 {
-                return Err(EngineError::new(
-                    "RangeError",
-                    "Iterator produced too many values",
-                    1,
-                    1,
-                ));
-            }
-        }
-        Ok(values)
+        self.iterator_to_list(iterator)
     }
 
     fn array_callback_method(
@@ -6837,6 +6875,22 @@ mod tests {
                 )
                 .unwrap(),
             "2:2:2"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "Array.from(iterMap.values()).join(',') + ':' + Array.from(iterSet.entries()).join(',')",
+                )
+                .unwrap(),
+            "1,2:3,3,4,4"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let mapFromArrayIterator = new Map([['x', 9], ['y', 8]].entries()); let setFromMapIterator = new Set(iterMap.values()); mapFromArrayIterator.get(1) + ':' + setFromMapIterator.size",
+                )
+                .unwrap(),
+            "y,8:2"
         );
     }
 

@@ -59,8 +59,10 @@ invariants and descriptor-aware behavior across every internal mutation path
 remain incomplete. The `Reflect` subset does not include symbols or every
 specification operation. Array and collection iterators are available through
 their methods, but the `Symbol.iterator` protocol and generic iterable
-consumption are not implemented; `for...of` and `Array.from` recognize only
-the runtime's supported built-in input types. Collection iteration handles
+consumption are not implemented; `Array.from`, `Map`, and `Set` can consume
+the engine's own array and collection iterator objects, but arbitrary
+user-defined iterators are not supported. `for...of` recognizes only the
+runtime's supported built-in collection types. Collection iteration handles
 basic additions and deletions, but the full collection API is not complete.
 `WeakMap` and `WeakSet` enforce object-key requirements but do not provide
 garbage-collection weak-reference behavior because the runtime has no garbage
