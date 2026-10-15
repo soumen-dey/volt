@@ -2,7 +2,7 @@ mod lexer;
 mod parser;
 
 use lexer::Lexer;
-use parser::{BinaryOp, Expr, Stmt, UnaryOp};
+use parser::{BinaryOp, DeclarationKind, Expr, Stmt, UnaryOp};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -103,12 +103,15 @@ impl std::error::Error for EngineError {}
 struct Binding {
     value: Value,
     mutable: bool,
+    initialized: bool,
+    var_binding: bool,
 }
 
 #[derive(Default)]
 struct Scope {
     bindings: HashMap<String, Binding>,
     parent: Option<ScopeId>,
+    var_scope: bool,
 }
 
 #[derive(Clone)]
@@ -117,6 +120,7 @@ enum NativeFunction {
     ObjectCreate,
     ObjectGetPrototypeOf,
     ObjectSetPrototypeOf,
+    Error(&'static str),
 }
 
 #[derive(Clone)]
@@ -125,6 +129,7 @@ enum Function {
         parameters: Vec<String>,
         body: Vec<Stmt>,
         closure: ScopeId,
+        strict: bool,
     },
     Native(NativeFunction),
 }
@@ -132,6 +137,7 @@ enum Function {
 #[derive(Default)]
 struct Object {
     properties: HashMap<String, Value>,
+    parameter_map: HashMap<String, (ScopeId, String)>,
     prototype: Option<ObjectId>,
     function: Option<Function>,
 }
@@ -139,6 +145,8 @@ struct Object {
 enum Completion {
     Normal(Value),
     Return(Value),
+    Break,
+    Continue,
 }
 
 /// A from-scratch, headless JavaScript interpreter for the subset listed in
@@ -149,17 +157,27 @@ pub struct Engine {
     scopes: Vec<Scope>,
     objects: Vec<Object>,
     object_prototype: ObjectId,
+    global_object: ObjectId,
+    error_prototypes: HashMap<&'static str, ObjectId>,
+    strict: bool,
 }
 
 impl Engine {
     pub fn new() -> Self {
         let mut engine = Self {
             global: 0,
-            scopes: vec![Scope::default()],
+            scopes: vec![Scope {
+                var_scope: true,
+                ..Scope::default()
+            }],
             objects: Vec::new(),
             object_prototype: 0,
+            global_object: 0,
+            error_prototypes: HashMap::new(),
+            strict: false,
         };
         engine.object_prototype = engine.alloc_object(None);
+        engine.global_object = engine.alloc_object(Some(engine.object_prototype));
         let object_constructor =
             engine.alloc_native(NativeFunction::Object, Some(engine.object_prototype));
         let create =
@@ -188,23 +206,69 @@ impl Engine {
             "setPrototypeOf",
             Value::Object(set_prototype),
         );
-        engine.scopes[engine.global].bindings.insert(
-            "Object".to_owned(),
-            Binding {
-                value: Value::Object(object_constructor),
-                mutable: false,
-            },
+        engine.set_property(
+            object_constructor,
+            "name",
+            Value::String("Object".to_owned()),
         );
+        engine.set_property(object_constructor, "length", Value::Number(1.0));
+        let object_prototype = engine.object_prototype;
+        engine.set_property(
+            object_prototype,
+            "constructor",
+            Value::Object(object_constructor),
+        );
+        engine.declare_global("Object", Value::Object(object_constructor), false);
         Self::declare_global(&mut engine, "undefined", Value::Undefined, false);
         Self::declare_global(&mut engine, "NaN", Value::Number(f64::NAN), false);
         Self::declare_global(&mut engine, "Infinity", Value::Number(f64::INFINITY), false);
+        let global_object = engine.global_object;
+        Self::declare_global(
+            &mut engine,
+            "globalThis",
+            Value::Object(global_object),
+            false,
+        );
+        engine.install_error_constructors();
         engine
     }
 
     fn declare_global(&mut self, name: &str, value: Value, mutable: bool) {
-        self.scopes[self.global]
-            .bindings
-            .insert(name.to_owned(), Binding { value, mutable });
+        self.scopes[self.global].bindings.insert(
+            name.to_owned(),
+            Binding {
+                value: value.clone(),
+                mutable,
+                initialized: true,
+                var_binding: false,
+            },
+        );
+        self.set_property(self.global_object, name, value);
+    }
+
+    fn install_error_constructors(&mut self) {
+        let error_base = self.alloc_object(Some(self.object_prototype));
+        self.set_property(error_base, "name", Value::String("Error".to_owned()));
+        self.set_property(error_base, "message", Value::String(String::new()));
+        self.error_prototypes.insert("Error", error_base);
+        for name in ["Error", "TypeError", "ReferenceError", "SyntaxError"] {
+            let constructor =
+                self.alloc_native(NativeFunction::Error(name), Some(self.object_prototype));
+            let prototype = if name == "Error" {
+                error_base
+            } else {
+                let prototype = self.alloc_object(Some(error_base));
+                self.error_prototypes.insert(name, prototype);
+                prototype
+            };
+            self.set_property(prototype, "name", Value::String(name.to_owned()));
+            self.set_property(prototype, "message", Value::String(String::new()));
+            self.set_property(prototype, "constructor", Value::Object(constructor));
+            self.set_property(constructor, "prototype", Value::Object(prototype));
+            self.set_property(constructor, "name", Value::String(name.to_owned()));
+            self.set_property(constructor, "length", Value::Number(1.0));
+            self.declare_global(name, Value::Object(constructor), false);
+        }
     }
 
     fn alloc_object(&mut self, prototype: Option<ObjectId>) -> ObjectId {
@@ -227,13 +291,17 @@ impl Engine {
         parameters: Vec<String>,
         body: Vec<Stmt>,
         closure: ScopeId,
+        strict: bool,
     ) -> ObjectId {
         let id = self.alloc_object(Some(self.object_prototype));
         self.objects[id].function = Some(Function::User {
-            parameters,
+            parameters: parameters.clone(),
             body,
             closure,
+            strict: strict || self.strict,
         });
+        self.set_property(id, "name", Value::String(String::new()));
+        self.set_property(id, "length", Value::Number(parameters.len() as f64));
         let prototype = self.alloc_object(Some(self.object_prototype));
         self.set_property(prototype, "constructor", Value::Object(id));
         self.set_property(id, "prototype", Value::Object(prototype));
@@ -245,7 +313,14 @@ impl Engine {
         self.scopes.push(Scope {
             bindings: HashMap::new(),
             parent: Some(parent),
+            var_scope: false,
         });
+        id
+    }
+
+    fn new_function_scope(&mut self, parent: ScopeId) -> ScopeId {
+        let id = self.new_scope(parent);
+        self.scopes[id].var_scope = true;
         id
     }
 
@@ -266,19 +341,126 @@ impl Engine {
                 column,
             ));
         }
-        self.scopes[scope]
-            .bindings
-            .insert(name.to_owned(), Binding { value, mutable });
+
+        self.scopes[scope].bindings.insert(
+            name.to_owned(),
+            Binding {
+                value,
+                mutable,
+                initialized: true,
+                var_binding: false,
+            },
+        );
         Ok(())
     }
 
-    fn get_binding(&self, mut scope: ScopeId, name: &str) -> Option<Value> {
+    fn declare_var_if_absent(&mut self, scope: ScopeId, name: &str) -> Result<(), EngineError> {
+        if let Some(binding) = self.scopes[scope].bindings.get(name) {
+            if !self.scopes[scope].var_scope || !binding.var_binding {
+                return Err(EngineError::new(
+                    "SyntaxError",
+                    format!("Identifier '{name}' has already been declared"),
+                    1,
+                    1,
+                ));
+            }
+            return Ok(());
+        }
+        let initial_value = if scope == self.global {
+            self.get_own_property(self.global_object, name)
+                .unwrap_or(Value::Undefined)
+        } else {
+            Value::Undefined
+        };
+        self.declare(scope, name, initial_value.clone(), true, 1, 1)?;
+        self.scopes[scope]
+            .bindings
+            .get_mut(name)
+            .expect("new var binding was just inserted")
+            .var_binding = true;
+        if scope == self.global {
+            self.set_property(self.global_object, name, initial_value);
+        }
+        Ok(())
+    }
+
+    fn declare_tdz(
+        &mut self,
+        scope: ScopeId,
+        name: &str,
+        mutable: bool,
+        line: usize,
+        column: usize,
+    ) -> Result<(), EngineError> {
+        if self.scopes[scope].bindings.contains_key(name) {
+            return Err(EngineError::new(
+                "SyntaxError",
+                format!("Identifier '{name}' has already been declared"),
+                line,
+                column,
+            ));
+        }
+        self.scopes[scope].bindings.insert(
+            name.to_owned(),
+            Binding {
+                value: Value::Undefined,
+                mutable,
+                initialized: false,
+                var_binding: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn initialize_binding(&mut self, scope: ScopeId, name: &str, value: Value) {
+        let binding = self.scopes[scope]
+            .bindings
+            .get_mut(name)
+            .expect("binding was instantiated before initialization");
+        binding.value = value;
+        binding.initialized = true;
+    }
+
+    fn var_scope(&self, mut scope: ScopeId) -> ScopeId {
         loop {
-            if let Some(binding) = self.scopes[scope].bindings.get(name) {
-                return Some(binding.value.clone());
+            if self.scopes[scope].var_scope {
+                return scope;
+            }
+            scope = self.scopes[scope]
+                .parent
+                .expect("every non-root scope has a parent");
+        }
+    }
+
+    fn find_binding_scope(&self, mut scope: ScopeId, name: &str) -> Option<ScopeId> {
+        loop {
+            if self.scopes[scope].bindings.contains_key(name) {
+                return Some(scope);
             }
             scope = self.scopes[scope].parent?;
         }
+    }
+
+    fn get_binding(
+        &self,
+        scope: ScopeId,
+        name: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<Value>, EngineError> {
+        if let Some(binding_scope) = self.find_binding_scope(scope, name) {
+            let binding = &self.scopes[binding_scope].bindings[name];
+            if !binding.initialized {
+                return Err(EngineError::new(
+                    "ReferenceError",
+                    format!("Cannot access '{name}' before initialization"),
+                    line,
+                    column,
+                ));
+            }
+            return Ok(Some(binding.value.clone()));
+        }
+        Ok(self.get_own_property(self.global_object, name))
     }
 
     fn assign_binding(
@@ -291,6 +473,14 @@ impl Engine {
     ) -> Result<Value, EngineError> {
         loop {
             if let Some(binding) = self.scopes[scope].bindings.get_mut(name) {
+                if !binding.initialized {
+                    return Err(EngineError::new(
+                        "ReferenceError",
+                        format!("Cannot access '{name}' before initialization"),
+                        line,
+                        column,
+                    ));
+                }
                 if !binding.mutable {
                     return Err(EngineError::new(
                         "TypeError",
@@ -300,9 +490,19 @@ impl Engine {
                     ));
                 }
                 binding.value = value.clone();
+                let is_global = scope == self.global;
+                let is_var_binding = binding.var_binding;
+                let _ = binding;
+                if is_global && is_var_binding {
+                    self.set_property(self.global_object, name, value.clone());
+                }
                 return Ok(value);
             }
             let Some(parent) = self.scopes[scope].parent else {
+                if !self.strict {
+                    self.set_property(self.global_object, name, value.clone());
+                    return Ok(value);
+                }
                 return Err(EngineError::new(
                     "ReferenceError",
                     format!("{name} is not defined"),
@@ -317,11 +517,21 @@ impl Engine {
     pub fn eval(&mut self, source: &str) -> Result<Value, EngineError> {
         let tokens = Lexer::new(source).tokenize()?;
         let program = parser::Parser::new(tokens).parse_program()?;
-        match self.execute_statements(&program.statements, self.global)? {
+        let previous_strict = self.strict;
+        self.strict = program.strict;
+        let execution = self.execute_statements(&program.statements, self.global);
+        self.strict = previous_strict;
+        match execution? {
             Completion::Normal(value) => Ok(value),
             Completion::Return(_) => Err(EngineError::new(
                 "SyntaxError",
                 "Return statement outside function",
+                1,
+                1,
+            )),
+            Completion::Break | Completion::Continue => Err(EngineError::new(
+                "SyntaxError",
+                "Invalid loop control statement",
                 1,
                 1,
             )),
@@ -342,6 +552,21 @@ impl Engine {
                             "function () { [native code] }".to_owned()
                         }
                     }
+                } else if self.is_error_object(*id) {
+                    let name = self
+                        .get_property(*id, "name")
+                        .map(|value| value.to_js_string())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "Error".to_owned());
+                    let message = self
+                        .get_property(*id, "message")
+                        .map(|value| value.to_js_string())
+                        .unwrap_or_default();
+                    if message.is_empty() {
+                        name
+                    } else {
+                        format!("{name}: {message}")
+                    }
                 } else {
                     "[object Object]".to_owned()
                 }
@@ -355,14 +580,105 @@ impl Engine {
         statements: &[Stmt],
         scope: ScopeId,
     ) -> Result<Completion, EngineError> {
+        self.instantiate_declarations(statements, scope)?;
         let mut result = Value::Undefined;
         for statement in statements {
             match self.execute_statement(statement, scope)? {
                 Completion::Normal(value) => result = value,
-                completion @ Completion::Return(_) => return Ok(completion),
+                completion @ (Completion::Return(_) | Completion::Break | Completion::Continue) => {
+                    return Ok(completion);
+                }
             }
         }
         Ok(Completion::Normal(result))
+    }
+
+    fn instantiate_declarations(
+        &mut self,
+        statements: &[Stmt],
+        scope: ScopeId,
+    ) -> Result<(), EngineError> {
+        let target = self.var_scope(scope);
+        let mut vars = Vec::new();
+        collect_var_names(statements, &mut vars);
+        for statement in statements {
+            if let Stmt::Declaration {
+                name,
+                kind: DeclarationKind::Let | DeclarationKind::Const,
+                line,
+                column,
+                ..
+            } = statement
+                && vars.iter().any(|var_name| var_name == name)
+            {
+                return Err(EngineError::new(
+                    "SyntaxError",
+                    format!("Identifier '{name}' is declared as both lexical and var"),
+                    *line,
+                    *column,
+                ));
+            }
+        }
+        for name in vars {
+            self.declare_var_if_absent(target, &name)?;
+        }
+        for statement in statements {
+            match statement {
+                Stmt::Declaration {
+                    name,
+                    kind: DeclarationKind::Let | DeclarationKind::Const,
+                    line,
+                    column,
+                    ..
+                } => self.declare_tdz(
+                    scope,
+                    name,
+                    matches!(
+                        statement,
+                        Stmt::Declaration {
+                            kind: DeclarationKind::Let,
+                            ..
+                        }
+                    ),
+                    *line,
+                    *column,
+                )?,
+                Stmt::FunctionDeclaration {
+                    name,
+                    parameters,
+                    body,
+                    strict,
+                } => {
+                    let function =
+                        self.alloc_user_function(parameters.clone(), body.clone(), scope, *strict);
+                    if let Some(binding) = self.scopes[scope].bindings.get_mut(name) {
+                        if !binding.var_binding {
+                            return Err(EngineError::new(
+                                "SyntaxError",
+                                format!("Identifier '{name}' has already been declared"),
+                                1,
+                                1,
+                            ));
+                        }
+                        binding.value = Value::Object(function);
+                        binding.initialized = true;
+                    } else {
+                        self.declare(scope, name, Value::Object(function), true, 1, 1)?;
+                        self.scopes[scope]
+                            .bindings
+                            .get_mut(name)
+                            .expect("function binding was just inserted")
+                            .var_binding = self.scopes[scope].var_scope;
+                    }
+                    if scope == self.global {
+                        self.set_property(self.global_object, name, Value::Object(function));
+                    }
+                    self.set_property(function, "name", Value::String(name.clone()));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn execute_statement(
@@ -378,27 +694,46 @@ impl Engine {
             Stmt::Declaration {
                 name,
                 initializer,
-                mutable,
-                line,
-                column,
+                kind,
+                line: _,
+                column: _,
             } => {
                 let value = if let Some(initializer) = initializer {
                     self.evaluate(initializer, scope)?
                 } else {
                     Value::Undefined
                 };
-                self.declare(scope, name, value, *mutable, *line, *column)?;
+                match kind {
+                    DeclarationKind::Var => {
+                        let target = self.var_scope(scope);
+                        if initializer.is_some() {
+                            self.initialize_binding(target, name, value.clone());
+                            if target == self.global {
+                                self.set_property(self.global_object, name, value.clone());
+                            }
+                        }
+                    }
+                    DeclarationKind::Let | DeclarationKind::Const => {
+                        if !self.scopes[scope].bindings.contains_key(name) {
+                            return Err(EngineError::new(
+                                "SyntaxError",
+                                "Lexical declaration is not valid in this statement position",
+                                1,
+                                1,
+                            ));
+                        }
+                        self.initialize_binding(scope, name, value.clone());
+                    }
+                }
+                if let Value::Object(function) = &value
+                    && self.objects[*function].function.is_some()
+                    && matches!(initializer, Some(Expr::Function { name: None, .. }))
+                {
+                    self.set_property(*function, "name", Value::String(name.clone()));
+                }
                 Ok(Completion::Normal(Value::Undefined))
             }
-            Stmt::FunctionDeclaration {
-                name,
-                parameters,
-                body,
-            } => {
-                let function = self.alloc_user_function(parameters.clone(), body.clone(), scope);
-                self.declare(scope, name, Value::Object(function), true, 1, 1)?;
-                Ok(Completion::Normal(Value::Undefined))
-            }
+            Stmt::FunctionDeclaration { .. } => Ok(Completion::Normal(Value::Undefined)),
             Stmt::Block(statements) => {
                 let block_scope = self.new_scope(scope);
                 self.execute_statements(statements, block_scope)
@@ -422,10 +757,72 @@ impl Engine {
                     match self.execute_statement(body, scope)? {
                         Completion::Normal(value) => result = value,
                         completion @ Completion::Return(_) => return Ok(completion),
+                        Completion::Break => break,
+                        Completion::Continue => continue,
                     }
                 }
                 Ok(Completion::Normal(result))
             }
+            Stmt::For {
+                initializer,
+                condition,
+                update,
+                body,
+            } => {
+                let mut loop_scope = self.new_scope(scope);
+                let per_iteration = matches!(
+                    initializer.as_deref(),
+                    Some(Stmt::Declaration {
+                        kind: DeclarationKind::Let | DeclarationKind::Const,
+                        ..
+                    })
+                );
+                if let Some(initializer) = initializer {
+                    let completion =
+                        self.execute_statements(std::slice::from_ref(initializer), loop_scope)?;
+                    if !matches!(completion, Completion::Normal(_)) {
+                        return Ok(completion);
+                    }
+                }
+                let mut result = Value::Undefined;
+                while match condition {
+                    Some(condition) => self.evaluate(condition, loop_scope)?.is_truthy(),
+                    None => true,
+                } {
+                    match self.execute_statement(body, loop_scope)? {
+                        Completion::Normal(value) => result = value,
+                        completion @ Completion::Return(_) => return Ok(completion),
+                        Completion::Break => break,
+                        Completion::Continue => {}
+                    }
+                    if per_iteration {
+                        let next_scope = self.new_scope(scope);
+                        self.scopes[next_scope].bindings = self.scopes[loop_scope].bindings.clone();
+                        loop_scope = next_scope;
+                    }
+                    if let Some(update) = update {
+                        result = self.evaluate(update, loop_scope)?;
+                    }
+                }
+                Ok(Completion::Normal(result))
+            }
+            Stmt::DoWhile { body, condition } => {
+                let mut result = Value::Undefined;
+                loop {
+                    match self.execute_statement(body, scope)? {
+                        Completion::Normal(value) => result = value,
+                        completion @ Completion::Return(_) => return Ok(completion),
+                        Completion::Break => break,
+                        Completion::Continue => {}
+                    }
+                    if !self.evaluate(condition, scope)?.is_truthy() {
+                        break;
+                    }
+                }
+                Ok(Completion::Normal(result))
+            }
+            Stmt::Break => Ok(Completion::Break),
+            Stmt::Continue => Ok(Completion::Continue),
             Stmt::Return(value) => {
                 let value = if let Some(value) = value {
                     self.evaluate(value, scope)?
@@ -476,17 +873,21 @@ impl Engine {
     fn evaluate(&mut self, expression: &Expr, scope: ScopeId) -> Result<Value, EngineError> {
         match expression {
             Expr::Literal(value) => Ok(value.clone()),
-            Expr::This => Ok(self.get_binding(scope, "this").unwrap_or(Value::Undefined)),
-            Expr::Identifier { name, line, column } => {
-                self.get_binding(scope, name).ok_or_else(|| {
+            Expr::This => match self.get_binding(scope, "this", 1, 1)? {
+                Some(value) => Ok(value),
+                None if self.strict => Ok(Value::Undefined),
+                None => Ok(Value::Object(self.global_object)),
+            },
+            Expr::Identifier { name, line, column } => self
+                .get_binding(scope, name, *line, *column)?
+                .ok_or_else(|| {
                     EngineError::new(
                         "ReferenceError",
                         format!("{name} is not defined"),
                         *line,
                         *column,
                     )
-                })
-            }
+                }),
             Expr::Assignment {
                 target,
                 value,
@@ -519,9 +920,13 @@ impl Engine {
                 column,
             } => {
                 if *operator == UnaryOp::TypeOf
-                    && matches!(operand.as_ref(), Expr::Identifier { name, .. } if self.get_binding(scope, name).is_none())
+                    && let Expr::Identifier { name, .. } = operand.as_ref()
+                    && self.get_binding(scope, name, *line, *column)?.is_none()
                 {
                     return Ok(Value::String("undefined".to_owned()));
+                }
+                if *operator == UnaryOp::Delete {
+                    return self.delete_reference(operand, scope, *line, *column);
                 }
                 let operand = self.evaluate(operand, scope)?;
                 match operator {
@@ -541,12 +946,7 @@ impl Engine {
                         .to_owned(),
                     )),
                     UnaryOp::Void => Ok(Value::Undefined),
-                    UnaryOp::Delete => Err(EngineError::new(
-                        "SyntaxError",
-                        "delete is not supported in this runtime subset",
-                        *line,
-                        *column,
-                    )),
+                    UnaryOp::Delete => unreachable!("delete handled before evaluation"),
                 }
             }
             Expr::Binary {
@@ -569,15 +969,19 @@ impl Engine {
                 name,
                 parameters,
                 body,
+                strict,
             } => {
-                let function = self.alloc_user_function(parameters.clone(), body.clone(), scope);
+                let function =
+                    self.alloc_user_function(parameters.clone(), body.clone(), scope, *strict);
                 if let Some(name) = name {
                     let name_scope = self.new_scope(scope);
                     self.declare(name_scope, name, Value::Object(function), false, 1, 1)?;
+                    self.set_property(function, "name", Value::String(name.clone()));
                     self.objects[function].function = Some(Function::User {
                         parameters: parameters.clone(),
                         body: body.clone(),
                         closure: name_scope,
+                        strict: *strict || self.strict,
                     });
                 }
                 Ok(Value::Object(function))
@@ -632,7 +1036,14 @@ impl Engine {
                         1,
                     ));
                 };
-                if self.objects[function_id].function.is_none() {
+                let constructible = matches!(
+                    self.objects[function_id].function,
+                    Some(Function::User { .. })
+                        | Some(Function::Native(
+                            NativeFunction::Object | NativeFunction::Error(_)
+                        ))
+                );
+                if !constructible {
                     return Err(EngineError::new(
                         "TypeError",
                         "Value is not a constructor",
@@ -709,7 +1120,111 @@ impl Engine {
                     _ => false,
                 })
             }
+            BinaryOp::In => {
+                let Value::Object(object) = right else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Right-hand side of 'in' is not an object",
+                        1,
+                        1,
+                    ));
+                };
+                boolean(self.get_property(object, &left.to_js_string()).is_some())
+            }
+            BinaryOp::InstanceOf => {
+                let Value::Object(constructor) = right else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Right-hand side of 'instanceof' is not callable",
+                        1,
+                        1,
+                    ));
+                };
+                if !self.is_constructor(constructor) {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Right-hand side of 'instanceof' is not a constructor",
+                        1,
+                        1,
+                    ));
+                }
+                let Some(Value::Object(prototype)) = self.get_property(constructor, "prototype")
+                else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Function has non-object prototype in instanceof check",
+                        1,
+                        1,
+                    ));
+                };
+                let Value::Object(object) = left else {
+                    return boolean(false);
+                };
+                let mut current = self.objects[object].prototype;
+                let mut visited = HashSet::new();
+                while let Some(id) = current {
+                    if id == prototype {
+                        return boolean(true);
+                    }
+                    if !visited.insert(id) {
+                        break;
+                    }
+                    current = self.objects[id].prototype;
+                }
+                boolean(false)
+            }
             BinaryOp::And | BinaryOp::Or | BinaryOp::Nullish => Ok(right),
+        }
+    }
+
+    fn delete_reference(
+        &mut self,
+        expression: &Expr,
+        scope: ScopeId,
+        line: usize,
+        column: usize,
+    ) -> Result<Value, EngineError> {
+        match expression {
+            Expr::Identifier { .. } => Ok(Value::Boolean(false)),
+            Expr::Member(object, property) => {
+                let object = self.evaluate(object, scope)?;
+                match object {
+                    Value::Object(id) => {
+                        self.objects[id].parameter_map.remove(property);
+                        self.objects[id].properties.remove(property);
+                        Ok(Value::Boolean(true))
+                    }
+                    Value::Null | Value::Undefined => Err(EngineError::new(
+                        "TypeError",
+                        "Cannot convert null or undefined to object",
+                        line,
+                        column,
+                    )),
+                    _ => Ok(Value::Boolean(true)),
+                }
+            }
+            Expr::Index(object, property) => {
+                let object = self.evaluate(object, scope)?;
+                let property = self.evaluate(property, scope)?.to_js_string();
+                match object {
+                    Value::Object(id) => {
+                        self.objects[id].parameter_map.remove(&property);
+                        self.objects[id].properties.remove(&property);
+                        Ok(Value::Boolean(true))
+                    }
+                    Value::Null | Value::Undefined => Err(EngineError::new(
+                        "TypeError",
+                        "Cannot convert null or undefined to object",
+                        line,
+                        column,
+                    )),
+                    _ => Ok(Value::Boolean(true)),
+                }
+            }
+            _ => {
+                self.evaluate(expression, scope)?;
+                Ok(Value::Boolean(true))
+            }
         }
     }
 
@@ -745,12 +1260,22 @@ impl Engine {
     }
 
     fn set_property(&mut self, object: ObjectId, name: &str, value: Value) {
+        if let Some((scope, binding_name)) = self.objects[object].parameter_map.get(name).cloned()
+            && let Some(binding) = self.scopes[scope].bindings.get_mut(&binding_name)
+        {
+            binding.value = value.clone();
+        }
         self.objects[object]
             .properties
             .insert(name.to_owned(), value);
     }
 
     fn get_own_property(&self, object: ObjectId, name: &str) -> Option<Value> {
+        if let Some((scope, binding_name)) = self.objects[object].parameter_map.get(name)
+            && let Some(binding) = self.scopes[*scope].bindings.get(binding_name)
+        {
+            return Some(binding.value.clone());
+        }
         self.objects[object].properties.get(name).cloned()
     }
 
@@ -767,6 +1292,35 @@ impl Engine {
             current = self.objects[id].prototype;
         }
         None
+    }
+
+    fn is_error_object(&self, object: ObjectId) -> bool {
+        let mut current = Some(object);
+        let mut visited = HashSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                return false;
+            }
+            if self
+                .error_prototypes
+                .values()
+                .any(|prototype| *prototype == id)
+            {
+                return true;
+            }
+            current = self.objects[id].prototype;
+        }
+        false
+    }
+
+    fn is_constructor(&self, object: ObjectId) -> bool {
+        matches!(
+            &self.objects[object].function,
+            Some(Function::User { .. })
+                | Some(Function::Native(
+                    NativeFunction::Object | NativeFunction::Error(_)
+                ))
+        )
     }
 
     fn get_property_value(
@@ -826,16 +1380,81 @@ impl Engine {
                 parameters,
                 body,
                 closure,
+                strict,
             } => {
-                let function_scope = self.new_scope(closure);
+                let function_scope = self.new_function_scope(closure);
+                let this_value = if strict {
+                    this_value
+                } else {
+                    match this_value {
+                        Value::Undefined | Value::Null => Value::Object(self.global_object),
+                        value => value,
+                    }
+                };
                 self.declare(function_scope, "this", this_value, true, 1, 1)?;
                 for (index, parameter) in parameters.iter().enumerate() {
                     let value = arguments.get(index).cloned().unwrap_or(Value::Undefined);
-                    self.declare(function_scope, parameter, value, true, 1, 1)?;
+                    if let Some(binding) = self.scopes[function_scope].bindings.get_mut(parameter) {
+                        binding.value = value;
+                    } else {
+                        self.declare(function_scope, parameter, value, true, 1, 1)?;
+                    }
+                    self.scopes[function_scope]
+                        .bindings
+                        .get_mut(parameter)
+                        .expect("parameter was just declared")
+                        .var_binding = true;
                 }
-                match self.execute_statements(&body, function_scope)? {
+                let arguments_object = self.alloc_object(Some(self.object_prototype));
+                for (index, argument) in arguments.iter().enumerate() {
+                    self.set_property(arguments_object, &index.to_string(), argument.clone());
+                }
+                self.set_property(
+                    arguments_object,
+                    "length",
+                    Value::Number(arguments.len() as f64),
+                );
+                if !strict {
+                    let mut mapped = HashSet::new();
+                    for (index, parameter) in parameters.iter().enumerate().rev() {
+                        if index < arguments.len() && mapped.insert(parameter.clone()) {
+                            self.objects[arguments_object]
+                                .parameter_map
+                                .insert(index.to_string(), (function_scope, parameter.clone()));
+                        }
+                    }
+                }
+                if !self.scopes[function_scope]
+                    .bindings
+                    .contains_key("arguments")
+                {
+                    self.declare(
+                        function_scope,
+                        "arguments",
+                        Value::Object(arguments_object),
+                        true,
+                        1,
+                        1,
+                    )?;
+                    self.scopes[function_scope]
+                        .bindings
+                        .get_mut("arguments")
+                        .expect("arguments binding was just declared")
+                        .var_binding = true;
+                }
+                let previous_strict = self.strict;
+                self.strict = strict;
+                let result = self.execute_statements(&body, function_scope);
+                self.strict = previous_strict;
+                match result? {
                     Completion::Normal(_) => Ok(Value::Undefined),
                     Completion::Return(value) => Ok(value),
+                    Completion::Break | Completion::Continue => Err(EngineError::new(
+                        "SyntaxError",
+                        "Invalid loop control statement",
+                        1,
+                        1,
+                    )),
                 }
             }
             Function::Native(native) => self.call_native(native, arguments),
@@ -929,11 +1548,28 @@ impl Engine {
                 self.objects[*id].prototype = prototype;
                 Ok(Value::Object(*id))
             }
+            NativeFunction::Error(name) => {
+                let prototype = self.error_prototypes.get(name).copied();
+                let object = self.alloc_object(prototype);
+                let message = arguments
+                    .first()
+                    .filter(|value| !matches!(value, Value::Undefined))
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_default();
+                self.set_property(object, "name", Value::String(name.to_owned()));
+                self.set_property(object, "message", Value::String(message));
+                Ok(Value::Object(object))
+            }
         }
     }
 
     fn error_object(&mut self, error: &EngineError) -> Value {
-        let object = self.alloc_object(Some(self.object_prototype));
+        let prototype = self
+            .error_prototypes
+            .get(error.name)
+            .copied()
+            .or_else(|| self.error_prototypes.get("Error").copied());
+        let object = self.alloc_object(prototype);
         self.set_property(object, "name", Value::String(error.name.to_owned()));
         self.set_property(object, "message", Value::String(error.message.clone()));
         Value::Object(object)
@@ -941,8 +1577,24 @@ impl Engine {
 
     fn thrown_error(&self, value: Value, line: usize, column: usize) -> EngineError {
         let message = self.to_string(&value);
+        let name = if let Value::Object(id) = &value {
+            if self.is_error_object(*id) {
+                self.get_property(*id, "name")
+                    .map(|name| match name {
+                        Value::String(name) if name == "TypeError" => "TypeError",
+                        Value::String(name) if name == "ReferenceError" => "ReferenceError",
+                        Value::String(name) if name == "SyntaxError" => "SyntaxError",
+                        _ => "Error",
+                    })
+                    .unwrap_or("Error")
+            } else {
+                "Error"
+            }
+        } else {
+            "Error"
+        };
         EngineError {
-            name: "Error",
+            name,
             message: format!("Uncaught {message}"),
             line,
             column,
@@ -954,6 +1606,61 @@ impl Engine {
 impl Default for Engine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn collect_var_names(statements: &[Stmt], names: &mut Vec<String>) {
+    for statement in statements {
+        match statement {
+            Stmt::Declaration {
+                name,
+                kind: DeclarationKind::Var,
+                ..
+            } => names.push(name.clone()),
+            Stmt::Block(statements) => collect_var_names(statements, names),
+            Stmt::If {
+                consequent,
+                alternate,
+                ..
+            } => {
+                collect_var_names(std::slice::from_ref(consequent), names);
+                if let Some(alternate) = alternate {
+                    collect_var_names(std::slice::from_ref(alternate), names);
+                }
+            }
+            Stmt::While { body, .. } => collect_var_names(std::slice::from_ref(body), names),
+            Stmt::For {
+                initializer, body, ..
+            } => {
+                if let Some(initializer) = initializer {
+                    collect_var_names(std::slice::from_ref(initializer), names);
+                }
+                collect_var_names(std::slice::from_ref(body), names);
+            }
+            Stmt::DoWhile { body, .. } => collect_var_names(std::slice::from_ref(body), names),
+            Stmt::Try {
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                collect_var_names(std::slice::from_ref(body), names);
+                if let Some(body) = catch_body {
+                    collect_var_names(std::slice::from_ref(body), names);
+                }
+                if let Some(body) = finally_body {
+                    collect_var_names(std::slice::from_ref(body), names);
+                }
+            }
+            Stmt::Empty
+            | Stmt::Expression(_)
+            | Stmt::FunctionDeclaration { .. }
+            | Stmt::Declaration { .. }
+            | Stmt::Return(_)
+            | Stmt::Throw(_)
+            | Stmt::Break
+            | Stmt::Continue => {}
+        }
     }
 }
 
@@ -1062,6 +1769,223 @@ mod tests {
                 )
                 .unwrap(),
             "ReferenceError"
+        );
+        assert_eq!(
+            engine.eval_to_string(
+                "try { throw new TypeError('bad'); } catch (error) { error.name + ':' + error.message; }",
+            ).unwrap(),
+            "TypeError:bad"
+        );
+    }
+
+    #[test]
+    fn var_is_function_scoped_hoisted_and_redeclarable() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine.eval_to_string(
+                "function readBeforeInit() { let before = typeof later; if (false) { var later = 10; } return before; } readBeforeInit()",
+            ).unwrap(),
+            "undefined"
+        );
+        assert_eq!(
+            engine.eval_to_string(
+                "function readFromBlock() { { var nested = 4; } return nested; } readFromBlock()",
+            ).unwrap(),
+            "4"
+        );
+        assert_eq!(
+            engine
+                .eval("var repeated = 1; var repeated = 2; repeated")
+                .unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            engine
+                .eval("function declaredLater() { return 9; } declaredLater()")
+                .unwrap(),
+            Value::Number(9.0)
+        );
+        engine.eval("implicitVarValue = 17").unwrap();
+        engine.eval("var implicitVarValue").unwrap();
+        assert_eq!(
+            engine.eval("implicitVarValue").unwrap(),
+            Value::Number(17.0)
+        );
+    }
+
+    #[test]
+    fn lexical_bindings_have_a_temporal_dead_zone() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine.eval("value; let value = 1").unwrap_err().name,
+            "ReferenceError"
+        );
+        assert_eq!(
+            engine.eval("let same = 1; var same = 2").unwrap_err().name,
+            "SyntaxError"
+        );
+        assert_eq!(
+            engine.eval("if (true) let invalid = 1").unwrap_err().name,
+            "SyntaxError"
+        );
+        assert_eq!(
+            engine.eval("try {} catch (error) error;").unwrap_err().name,
+            "SyntaxError"
+        );
+    }
+
+    #[test]
+    fn strict_mode_controls_this_assignment_and_early_errors() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval("function sloppyThis() { return this; } sloppyThis() === globalThis")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            engine
+                .eval("\"use strict\"; function strictThis() { return this; } strictThis()")
+                .unwrap(),
+            Value::Undefined
+        );
+        assert_eq!(
+            engine
+                .eval("implicitGlobal = 3; globalThis.implicitGlobal")
+                .unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            engine
+                .eval("\"use strict\"; anotherImplicit = 3")
+                .unwrap_err()
+                .name,
+            "ReferenceError"
+        );
+        assert_eq!(
+            engine
+                .eval("\"use strict\"; function duplicate(a, a) {}")
+                .unwrap_err()
+                .name,
+            "SyntaxError"
+        );
+        assert_eq!(
+            engine
+                .eval("\"use strict\"; delete localName")
+                .unwrap_err()
+                .name,
+            "SyntaxError"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let ownStrict = function() { 'use strict'; return this; }; typeof ownStrict()",
+                )
+                .unwrap(),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn functions_expose_names_lengths_and_arguments() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "function combine(left, right) { return combine.name + ':' + combine.length + ':' + arguments.length + ':' + arguments[0] + ':' + left + right; } combine(2, 3, 4)",
+                )
+                .unwrap(),
+            "combine:2:3:2:23"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("function f(a) { var a; return a; } f(8)")
+                .unwrap(),
+            "8"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let inferred = function() {}; inferred.name + ':' + inferred.length",
+                )
+                .unwrap(),
+            "inferred:0"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "function mapped(value) { value = 9; return arguments[0]; } mapped(1)",
+                )
+                .unwrap(),
+            "9"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "function mappedBack(value) { arguments[0] = 12; return value; } mappedBack(1)",
+                )
+                .unwrap(),
+            "12"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "function unmapped(value) { 'use strict'; value = 9; return arguments[0]; } unmapped(1)",
+                )
+                .unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn supports_in_instanceof_and_property_delete() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine.eval(
+                "function Box() {} let box = new Box; 'constructor' in Box.prototype && box instanceof Box",
+            ).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            engine
+                .eval("let subject = { value: 1 }; delete subject.value && !('value' in subject)",)
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            engine.eval("({}) instanceof Object").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            engine.eval("delete subject.missing").unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn for_and_do_while_handle_loop_control_and_lexical_scope() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine.eval_to_string(
+                "let total = 0; for (let i = 0; i < 8; i = i + 1) { if (i === 2) continue; if (i === 6) break; total = total + i; } total",
+            ).unwrap(),
+            "13"
+        );
+        assert_eq!(
+            engine.eval_to_string(
+                "let count = 0; do { count = count + 1; } while (count < 3); count",
+            ).unwrap(),
+            "3"
+        );
+        assert_eq!(
+            engine.eval("typeof i").unwrap(),
+            Value::String("undefined".to_owned())
+        );
+        assert_eq!(
+            engine.eval_to_string(
+                "let callbacks = {}; for (let index = 0; index < 2; index = index + 1) { if (index === 0) callbacks.first = function() { return index; }; else callbacks.second = function() { return index; }; } callbacks.first() + callbacks.second()",
+            ).unwrap(),
+            "1"
         );
     }
 

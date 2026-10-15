@@ -14,22 +14,31 @@ part of the runtime target.
 The interpreter currently supports:
 
 - `undefined`, `null`, booleans, decimal numbers, and single-/double-quoted strings
-- `let`, `const`, and `var` declarations (currently block-scoped)
+- `let` and `const` block bindings, function/global-scoped `var`, declaration
+  hoisting, lexical TDZ checks, and function declarations
 - arithmetic, comparison, equality, logical, and nullish-coalescing operators
-- assignment to declared identifiers and object properties
+- assignment to identifiers and object properties
 - unary `!`, `+`, `-`, `typeof`, and `void`
-- blocks, `if`/`else`, `while`, and `try`/`catch`/`finally`
-- function declarations and expressions, parameters, return, closures, and method `this`
+- blocks, `if`/`else`, `while`, `do...while`, C-style `for`, `break`, and
+  `continue`
+- strict-mode directives and selected strict-mode early/runtime errors
+- function declarations and expressions, parameters, return, closures,
+  function names/length, `arguments`, and strict/sloppy direct-call `this`
 - object literals, property reads/writes, constructor calls, prototype lookup,
-  and `Object.create`, `Object.getPrototypeOf`, and `Object.setPrototypeOf`
+  `in`, `instanceof`, and `Object.create`, `Object.getPrototypeOf`, and
+  `Object.setPrototypeOf`
+- `try`/`catch`/`finally`, explicit throws, and basic `Error`,
+  `TypeError`, `ReferenceError`, and `SyntaxError` objects
 - line and block comments
 - a persistent global environment across evaluations
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
-Arrays, classes, many constructor edge cases, `this` binding rules beyond
-direct method calls, complete ECMAScript error objects, modules, promises/jobs,
-and most standard built-ins are not implemented. Unsupported syntax reports a
-`SyntaxError`. Object and scope storage is engine-owned and reclaimed
+Arrays, classes, many constructor edge cases, complete `this` binding rules,
+complete ECMAScript error objects, modules, promises/jobs, and most standard
+built-ins are not implemented. The parser and runtime semantics remain a
+limited subset; passing the focused Rust tests does not establish general
+ECMAScript conformance. Unsupported syntax reports a `SyntaxError`. Object and
+scope storage is engine-owned and reclaimed
 when the engine is dropped; there is no garbage collector yet, so long-running
 engines retain allocations made by evaluated scripts. This implementation must
 not be used to execute untrusted or unbounded scripts; it does not yet enforce
