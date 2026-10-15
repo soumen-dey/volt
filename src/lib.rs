@@ -130,6 +130,8 @@ enum NativeFunction {
     Array,
     ArrayIsArray,
     ArrayMethod(&'static str),
+    ArrayIteratorMethod(&'static str),
+    IteratorNext,
     String,
     StringMethod(&'static str),
     Number,
@@ -162,6 +164,14 @@ struct Object {
     function: Option<Function>,
     is_array: bool,
     extensible: bool,
+    array_iterator: Option<ArrayIterator>,
+}
+
+#[derive(Clone)]
+struct ArrayIterator {
+    array: ObjectId,
+    index: usize,
+    kind: &'static str,
 }
 
 #[derive(Clone)]
@@ -212,6 +222,7 @@ pub struct Engine {
     object_prototype: ObjectId,
     global_object: ObjectId,
     array_prototype: ObjectId,
+    array_iterator_prototype: ObjectId,
     string_prototype: ObjectId,
     number_prototype: ObjectId,
     boolean_prototype: ObjectId,
@@ -232,6 +243,7 @@ impl Engine {
             object_prototype: 0,
             global_object: 0,
             array_prototype: 0,
+            array_iterator_prototype: 0,
             string_prototype: 0,
             number_prototype: 0,
             boolean_prototype: 0,
@@ -246,6 +258,7 @@ impl Engine {
         engine.object_prototype = engine.alloc_object(None);
         engine.global_object = engine.alloc_object(Some(engine.object_prototype));
         engine.array_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.array_iterator_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.string_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.number_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.boolean_prototype = engine.alloc_object(Some(engine.object_prototype));
@@ -534,16 +547,29 @@ impl Engine {
             ("fill", 1.0),
             ("copyWithin", 2.0),
             ("sort", 1.0),
+            ("keys", 0.0),
+            ("values", 0.0),
+            ("entries", 0.0),
         ] {
-            let function = self.alloc_native(
-                NativeFunction::ArrayMethod(name),
-                Some(self.object_prototype),
-            );
+            let native = match name {
+                "keys" | "values" | "entries" => NativeFunction::ArrayIteratorMethod(name),
+                _ => NativeFunction::ArrayMethod(name),
+            };
+            let function = self.alloc_native(native, Some(self.object_prototype));
             self.set_property(function, "name", Value::String(name.to_owned()));
             self.set_property(function, "length", Value::Number(arity));
             self.set_builtin_property(self.array_prototype, name, Value::Object(function));
         }
         self.declare_global("Array", Value::Object(constructor), false);
+        let iterator_next =
+            self.alloc_native(NativeFunction::IteratorNext, Some(self.object_prototype));
+        self.set_property(iterator_next, "name", Value::String("next".to_owned()));
+        self.set_property(iterator_next, "length", Value::Number(0.0));
+        self.set_builtin_property(
+            self.array_iterator_prototype,
+            "next",
+            Value::Object(iterator_next),
+        );
     }
 
     fn install_primitive_builtins(&mut self) {
@@ -768,6 +794,16 @@ impl Engine {
             },
         );
         array
+    }
+
+    fn alloc_array_iterator(&mut self, array: ObjectId, kind: &'static str) -> ObjectId {
+        let iterator = self.alloc_object(Some(self.array_iterator_prototype));
+        self.objects[iterator].array_iterator = Some(ArrayIterator {
+            array,
+            index: 0,
+            kind,
+        });
+        iterator
     }
 
     fn alloc_native(&mut self, native: NativeFunction, prototype: Option<ObjectId>) -> ObjectId {
@@ -2675,6 +2711,76 @@ impl Engine {
             NativeFunction::ArrayMethod(method) => {
                 self.call_array_method(method, this_value, arguments)
             }
+            NativeFunction::ArrayIteratorMethod(kind) => {
+                let Value::Object(array) = this_value else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Array iterator method called on a non-object",
+                        1,
+                        1,
+                    ));
+                };
+                if !self.objects[array].is_array {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Array iterator method called on a non-array",
+                        1,
+                        1,
+                    ));
+                }
+                Ok(Value::Object(self.alloc_array_iterator(array, kind)))
+            }
+            NativeFunction::IteratorNext => {
+                let Value::Object(iterator) = this_value else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Array Iterator next called on an incompatible receiver",
+                        1,
+                        1,
+                    ));
+                };
+                let Some(state) = self.objects[iterator].array_iterator.clone() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Array Iterator next called on an incompatible receiver",
+                        1,
+                        1,
+                    ));
+                };
+                let result = self.alloc_object(Some(self.object_prototype));
+                if state.index >= self.array_length(state.array) {
+                    self.set_property(result, "value", Value::Undefined);
+                    self.set_property(result, "done", Value::Boolean(true));
+                } else {
+                    let index = state.index;
+                    let value = match state.kind {
+                        "keys" => Value::Number(index as f64),
+                        "values" => self
+                            .get_property(state.array, &index.to_string())
+                            .unwrap_or(Value::Undefined),
+                        "entries" => {
+                            let pair = self.alloc_array();
+                            self.set_property(pair, "0", Value::Number(index as f64));
+                            self.set_property(
+                                pair,
+                                "1",
+                                self.get_property(state.array, &index.to_string())
+                                    .unwrap_or(Value::Undefined),
+                            );
+                            Value::Object(pair)
+                        }
+                        _ => unreachable!("known array iterator kind"),
+                    };
+                    self.objects[iterator]
+                        .array_iterator
+                        .as_mut()
+                        .expect("iterator state exists")
+                        .index += 1;
+                    self.set_property(result, "value", value);
+                    self.set_property(result, "done", Value::Boolean(false));
+                }
+                Ok(Value::Object(result))
+            }
             NativeFunction::String => Ok(Value::String(
                 arguments
                     .first()
@@ -3197,12 +3303,11 @@ impl Engine {
         }
         if method == "from" {
             let mut values = match arguments.first() {
-                Some(Value::Object(id)) if self.objects[*id].is_array => {
-                    let length = self.array_length(*id);
-                    (0..length)
-                        .map(|index| self.get_property(*id, &index.to_string()))
-                        .collect()
-                }
+                Some(Value::Object(id)) if self.objects[*id].is_array => self
+                    .array_iterator_values(*id)?
+                    .into_iter()
+                    .map(Some)
+                    .collect(),
                 Some(Value::String(value)) => value
                     .chars()
                     .map(|character| Some(Value::String(character.to_string())))
@@ -3691,6 +3796,45 @@ impl Engine {
         } else {
             output.push(value.clone());
         }
+    }
+
+    fn array_iterator_values(&mut self, array: ObjectId) -> Result<Vec<Value>, EngineError> {
+        let iterator = self.alloc_array_iterator(array, "values");
+        let next = self
+            .get_property(iterator, "next")
+            .unwrap_or(Value::Undefined);
+        let mut values = Vec::new();
+        loop {
+            let Value::Object(result) =
+                self.call(next.clone(), Value::Object(iterator), Vec::new())?
+            else {
+                return Err(EngineError::new(
+                    "TypeError",
+                    "Iterator next() did not return an object",
+                    1,
+                    1,
+                ));
+            };
+            if self
+                .get_property(result, "done")
+                .is_some_and(|done| done.is_truthy())
+            {
+                break;
+            }
+            values.push(
+                self.get_property(result, "value")
+                    .unwrap_or(Value::Undefined),
+            );
+            if values.len() > 1_000_000 {
+                return Err(EngineError::new(
+                    "RangeError",
+                    "Iterator produced too many values",
+                    1,
+                    1,
+                ));
+            }
+        }
+        Ok(values)
     }
 
     fn array_callback_method(
@@ -5584,6 +5728,39 @@ mod tests {
                 )
                 .unwrap(),
             "1,2,2,4,3,6"
+        );
+    }
+
+    #[test]
+    fn array_key_value_and_entry_iterators_return_iterator_results() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let values = [4,,6]; let iterator = values.values(); let first = iterator.next(); values[1] = 5; let second = iterator.next(); first.value + second.value + ':' + second.done + ':' + iterator.next().value",
+                )
+                .unwrap(),
+            "9:false:6"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let keys = [7,8].keys(); let entries = [7,8].entries(); keys.next().value + ':' + entries.next().value.join('-') + ':' + entries.next().done",
+                )
+                .unwrap(),
+            "0:0-7:false"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("let doneIterator = [1].values(); doneIterator.next().done + ':' + doneIterator.next().done + ':' + doneIterator.next().value")
+                .unwrap(),
+            "false:true:undefined"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("Array.from([3,4]).join(',')")
+                .unwrap(),
+            "3,4"
         );
     }
 
