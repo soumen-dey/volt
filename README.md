@@ -31,8 +31,8 @@ The interpreter currently supports:
   `Object.setPrototypeOf`, basic data-property descriptors and integrity
   operations, plus `Object.keys`, `getOwnPropertyNames`, `values`, `entries`,
   `assign`, `fromEntries`, `hasOwn`, and `is`
-- a basic string-keyed `Reflect` subset for property access, definition,
-  deletion, own keys, prototype operations, and extensibility
+- a basic string-keyed `Reflect` subset for apply/construct, property access,
+  definition, deletion, own keys, prototype operations, and extensibility
 - sparse array literals and basic `Array` construction, indexed properties,
   mutable `length`, and common array methods (`push`, `pop`, `shift`,
   `unshift`, `splice`, `slice`, `concat`, `join`, `reverse`, `flat`, `flatMap`,

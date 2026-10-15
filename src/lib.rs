@@ -455,6 +455,8 @@ impl Engine {
     fn install_reflect_builtins(&mut self) {
         let reflect = self.alloc_object(Some(self.object_prototype));
         for (name, arity) in [
+            ("apply", 3.0),
+            ("construct", 2.0),
             ("get", 2.0),
             ("set", 3.0),
             ("has", 2.0),
@@ -2964,6 +2966,60 @@ impl Engine {
                 .unwrap_or_else(|| "undefined".to_owned())
         };
         match method {
+            "apply" => {
+                let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let this_arg = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                let args_list = arguments.get(2).cloned().unwrap_or(Value::Undefined);
+                let values = self.argument_list_values(args_list)?;
+                self.call(target, this_arg, values)
+            }
+            "construct" => {
+                let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let Value::Object(target_id) = target.clone() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Reflect.construct target must be a constructor",
+                        1,
+                        1,
+                    ));
+                };
+                if !self.is_constructor(target_id) {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Reflect.construct target must be a constructor",
+                        1,
+                        1,
+                    ));
+                }
+                let new_target = arguments.get(2).cloned().unwrap_or_else(|| target.clone());
+                let Value::Object(new_target_id) = new_target else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Reflect.construct newTarget must be a constructor",
+                        1,
+                        1,
+                    ));
+                };
+                if !self.is_constructor(new_target_id) {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Reflect.construct newTarget must be a constructor",
+                        1,
+                        1,
+                    ));
+                }
+                let args_list = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                let values = self.argument_list_values(args_list)?;
+                let prototype = match self.get_property(new_target_id, "prototype") {
+                    Some(Value::Object(prototype)) => Some(prototype),
+                    _ => Some(self.object_prototype),
+                };
+                let instance = self.alloc_object(prototype);
+                match self.call(target, Value::Object(instance), values)? {
+                    object @ Value::Object(_) => Ok(object),
+                    _ => Ok(Value::Object(instance)),
+                }
+            }
             "get" => self.get_property_with_receiver(
                 target,
                 arguments.get(2).cloned().unwrap_or(Value::Object(target)),
@@ -3087,6 +3143,42 @@ impl Engine {
                 }
             }
             _ => unreachable!("known Reflect method"),
+        }
+    }
+
+    fn argument_list_values(&self, list: Value) -> Result<Vec<Value>, EngineError> {
+        match list {
+            Value::Undefined | Value::Null => Ok(Vec::new()),
+            Value::Object(object) => {
+                let length = self
+                    .get_property(object, "length")
+                    .unwrap_or(Value::Undefined)
+                    .to_number();
+                let length = if length.is_nan() || length <= 0.0 {
+                    0
+                } else if !length.is_finite() || length > 1_000_000.0 {
+                    return Err(EngineError::new(
+                        "RangeError",
+                        "Argument list is too large",
+                        1,
+                        1,
+                    ));
+                } else {
+                    length.trunc() as usize
+                };
+                Ok((0..length)
+                    .map(|index| {
+                        self.get_property(object, &index.to_string())
+                            .unwrap_or(Value::Undefined)
+                    })
+                    .collect())
+            }
+            _ => Err(EngineError::new(
+                "TypeError",
+                "Argument list must be an object",
+                1,
+                1,
+            )),
         }
     }
 
@@ -5704,6 +5796,34 @@ mod tests {
         );
         assert_eq!(
             engine.eval("Reflect.get(1, 'x')").unwrap_err().name,
+            "TypeError"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "function sum(a, b) { return this.base + a + b; } Reflect.apply(sum, { base: 4 }, [2, 3])",
+                )
+                .unwrap(),
+            "9"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "function Box(value) { this.value = value; } let instance = Reflect.construct(Box, [7]); instance.value + ':' + (instance instanceof Box)",
+                )
+                .unwrap(),
+            "7:true"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "function Box(value) { this.value = value; } function Other() {} Other.prototype.kind = 'other'; let otherInstance = Reflect.construct(Box, [8], Other); otherInstance.value + ':' + otherInstance.kind + ':' + (otherInstance instanceof Other)",
+                )
+                .unwrap(),
+            "8:other:true"
+        );
+        assert_eq!(
+            engine.eval("Reflect.construct(1, [])").unwrap_err().name,
             "TypeError"
         );
     }
