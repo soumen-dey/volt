@@ -31,6 +31,8 @@ The interpreter currently supports:
   `Object.setPrototypeOf`, basic data-property descriptors and integrity
   operations, plus `Object.keys`, `getOwnPropertyNames`, `values`, `entries`,
   `assign`, `fromEntries`, `hasOwn`, and `is`
+- a basic string-keyed `Reflect` subset for property access, definition,
+  deletion, own keys, prototype operations, and extensibility
 - sparse array literals and basic `Array` construction, indexed properties,
   mutable `length`, and common array methods (`push`, `pop`, `shift`,
   `unshift`, `splice`, `slice`, `concat`, `join`, `reverse`, `flat`, `flatMap`,
@@ -48,7 +50,8 @@ The interpreter currently supports:
 The built-ins are a focused subset, not the full ECMAScript standard library.
 Property descriptors include basic data and accessor behavior, but descriptor
 invariants and descriptor-aware behavior across every internal mutation path
-remain incomplete. Array iteration protocols and some methods,
+remain incomplete. The `Reflect` subset does not include symbols or every
+specification operation. Array iteration protocols and some methods,
 complete string/number behavior, `Date`, `RegExp`, `Symbol`, `BigInt`, `Proxy`,
 `Reflect`, modules, promises/jobs, and many other specified APIs are not implemented.
 Classes, many constructor edge cases, complete `this` binding rules, and
@@ -103,12 +106,15 @@ The intended sequence is to grow the own implementation incrementally:
 5. Make the Test262 harness work with the owned runtime and measure progress
    against a pinned suite revision; only then expand toward ES2020.
 
-The repository's Test262 runner is an initial scaffold, not currently a valid
-conformance harness for this implementation. It depends on features (including
-the standard library and harness behavior) that the interpreter does not yet
-provide. Do not interpret its results as an ECMAScript pass rate. Each stage
-should add focused tests, then update the harness and publish explicit pass,
-fail, and skip counts.
+The Test262 runner records scenario pass/fail/skip counts and is pinned to
+`tc39/test262` revision
+`d53ebc8b1931d9f1541e43d59650776e4b766248`. It requires a checkout at that
+revision by default; `--allow-unpinned` is available for explicitly exploratory
+runs and is recorded in the report. The runner is not yet a full Test262
+conformance harness: modules, async host protocols, Test262 harness facilities,
+and much of the language and standard library are unsupported. No conformance
+rate should be claimed until the pinned suite is run and its results are
+reviewed.
 
 ## Checks
 

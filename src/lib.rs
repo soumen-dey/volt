@@ -124,6 +124,7 @@ enum NativeFunction {
     ObjectDefineProperty,
     ObjectGetOwnPropertyDescriptor,
     ObjectIntegrity(&'static str),
+    Reflect(&'static str),
     ObjectMethod(&'static str),
     Error(&'static str),
     Array,
@@ -334,6 +335,7 @@ impl Engine {
             .insert("constructor".to_owned());
         engine.declare_global("Object", Value::Object(object_constructor), false);
         engine.install_object_builtins(object_constructor);
+        engine.install_reflect_builtins();
         engine.install_array_builtins();
         engine.install_primitive_builtins();
         engine.install_math_builtins();
@@ -448,6 +450,30 @@ impl Engine {
         self.set_property(is, "name", Value::String("is".to_owned()));
         self.set_property(is, "length", Value::Number(2.0));
         self.set_property(constructor, "is", Value::Object(is));
+    }
+
+    fn install_reflect_builtins(&mut self) {
+        let reflect = self.alloc_object(Some(self.object_prototype));
+        for (name, arity) in [
+            ("get", 2.0),
+            ("set", 3.0),
+            ("has", 2.0),
+            ("deleteProperty", 2.0),
+            ("ownKeys", 1.0),
+            ("getPrototypeOf", 1.0),
+            ("setPrototypeOf", 2.0),
+            ("isExtensible", 1.0),
+            ("preventExtensions", 1.0),
+            ("getOwnPropertyDescriptor", 2.0),
+            ("defineProperty", 3.0),
+        ] {
+            let function =
+                self.alloc_native(NativeFunction::Reflect(name), Some(self.object_prototype));
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(arity));
+            self.set_property(reflect, name, Value::Object(function));
+        }
+        self.declare_global("Reflect", Value::Object(reflect), false);
     }
 
     fn install_array_builtins(&mut self) {
@@ -2905,6 +2931,7 @@ impl Engine {
                     _ => unreachable!("known object integrity method"),
                 }
             }
+            NativeFunction::Reflect(method) => self.call_reflect(method, arguments),
             NativeFunction::Error(name) => {
                 let prototype = self.error_prototypes.get(name).copied();
                 let object = self.alloc_object(prototype);
@@ -2917,6 +2944,149 @@ impl Engine {
                 self.set_property(object, "message", Value::String(message));
                 Ok(Value::Object(object))
             }
+        }
+    }
+
+    fn call_reflect(&mut self, method: &str, arguments: Vec<Value>) -> Result<Value, EngineError> {
+        let Some(Value::Object(target)) = arguments.first() else {
+            return Err(EngineError::new(
+                "TypeError",
+                format!("Reflect.{method} requires an object target"),
+                1,
+                1,
+            ));
+        };
+        let target = *target;
+        let key = || {
+            arguments
+                .get(1)
+                .map(Value::to_js_string)
+                .unwrap_or_else(|| "undefined".to_owned())
+        };
+        match method {
+            "get" => self.get_property_with_receiver(
+                target,
+                arguments.get(2).cloned().unwrap_or(Value::Object(target)),
+                &key(),
+            ),
+            "set" => {
+                let key = key();
+                let value = arguments.get(2).cloned().unwrap_or(Value::Undefined);
+                let receiver = arguments.get(3).cloned().unwrap_or(Value::Object(target));
+                let Value::Object(receiver_id) = receiver else {
+                    return Ok(Value::Boolean(false));
+                };
+                let mut current = Some(target);
+                let mut visited = HashSet::new();
+                while let Some(owner) = current {
+                    if !visited.insert(owner) {
+                        break;
+                    }
+                    if let Some(attributes) =
+                        self.objects[owner].property_attributes.get(&key).cloned()
+                    {
+                        match attributes.kind {
+                            PropertyKind::Accessor {
+                                setter: Some(setter),
+                                ..
+                            } => {
+                                self.call(setter, Value::Object(receiver_id), vec![value])?;
+                                return Ok(Value::Boolean(true));
+                            }
+                            PropertyKind::Accessor { setter: None, .. } => {
+                                return Ok(Value::Boolean(false));
+                            }
+                            PropertyKind::Data if !attributes.writable => {
+                                return Ok(Value::Boolean(false));
+                            }
+                            PropertyKind::Data => break,
+                        }
+                    }
+                    current = self.objects[owner].prototype;
+                }
+                if !self.objects[receiver_id].properties.contains_key(&key)
+                    && !self.objects[receiver_id].extensible
+                {
+                    return Ok(Value::Boolean(false));
+                }
+                if self.objects[receiver_id]
+                    .property_attributes
+                    .get(&key)
+                    .is_some_and(|attributes| !attributes.writable)
+                {
+                    return Ok(Value::Boolean(false));
+                }
+                self.set_property(receiver_id, &key, value);
+                Ok(Value::Boolean(true))
+            }
+            "has" => Ok(Value::Boolean(self.get_property(target, &key()).is_some())),
+            "deleteProperty" => {
+                let name = key();
+                if self.objects[target]
+                    .property_attributes
+                    .get(&name)
+                    .is_some_and(|attributes| !attributes.configurable)
+                {
+                    return Ok(Value::Boolean(false));
+                }
+                self.remove_property(target, &name);
+                Ok(Value::Boolean(true))
+            }
+            "ownKeys" => {
+                let keys = self.alloc_array();
+                for (index, name) in self.own_property_names(target).into_iter().enumerate() {
+                    self.set_property(keys, &index.to_string(), Value::String(name));
+                }
+                Ok(Value::Object(keys))
+            }
+            "getPrototypeOf" => Ok(self.objects[target]
+                .prototype
+                .map(Value::Object)
+                .unwrap_or(Value::Null)),
+            "setPrototypeOf" => {
+                let prototype = match arguments.get(1).unwrap_or(&Value::Undefined) {
+                    Value::Null => None,
+                    Value::Object(id) => Some(*id),
+                    _ => {
+                        return Err(EngineError::new(
+                            "TypeError",
+                            "Prototype must be an object or null",
+                            1,
+                            1,
+                        ));
+                    }
+                };
+                if !self.objects[target].extensible && self.objects[target].prototype != prototype {
+                    return Ok(Value::Boolean(false));
+                }
+                self.objects[target].prototype = prototype;
+                Ok(Value::Boolean(true))
+            }
+            "isExtensible" => Ok(Value::Boolean(self.objects[target].extensible)),
+            "preventExtensions" => {
+                self.objects[target].extensible = false;
+                Ok(Value::Boolean(true))
+            }
+            "getOwnPropertyDescriptor" => Ok(self
+                .property_descriptor(target, &key())
+                .map(Value::Object)
+                .unwrap_or(Value::Undefined)),
+            "defineProperty" => {
+                let Some(Value::Object(descriptor)) = arguments.get(2) else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Property descriptor must be an object",
+                        1,
+                        1,
+                    ));
+                };
+                match self.define_data_property(target, &key(), *descriptor) {
+                    Ok(()) => Ok(Value::Boolean(true)),
+                    Err(error) if error.name == "TypeError" => Ok(Value::Boolean(false)),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => unreachable!("known Reflect method"),
         }
     }
 
@@ -5502,6 +5672,39 @@ mod tests {
                 )
                 .unwrap(),
             "5:first,second:true"
+        );
+    }
+
+    #[test]
+    fn reflect_core_operations_use_object_properties() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let object = { value: 2 }; Reflect.set(object, 'value', 5) + ':' + Reflect.get(object, 'value') + ':' + Reflect.has(object, 'value')",
+                )
+                .unwrap(),
+            "true:5:true"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let lockedTarget = {}; let defined = Reflect.defineProperty(lockedTarget, 'locked', { value: 3, writable: false, configurable: false }); defined + ':' + Reflect.set(lockedTarget, 'locked', 4) + ':' + Reflect.deleteProperty(lockedTarget, 'locked') + ':' + Reflect.ownKeys(lockedTarget).join(',')",
+                )
+                .unwrap(),
+            "true:false:false:locked"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let proto = {}; let reflectTarget = Object.create(proto); Reflect.setPrototypeOf(reflectTarget, proto) + ':' + (Reflect.getPrototypeOf(reflectTarget) === proto) + ':' + Reflect.preventExtensions(reflectTarget) + ':' + Reflect.isExtensible(reflectTarget)",
+                )
+                .unwrap(),
+            "true:true:true:false"
+        );
+        assert_eq!(
+            engine.eval("Reflect.get(1, 'x')").unwrap_err().name,
+            "TypeError"
         );
     }
 

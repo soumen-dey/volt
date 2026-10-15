@@ -7,14 +7,26 @@ const { spawnSync } = require("node:child_process");
 const TestStream = require("test262-stream");
 
 const root = path.resolve(__dirname, "..", "..");
-const args = parseArgs(process.argv.slice(2));
+const PIN_PATH = path.join(__dirname, "revision.json");
 
 async function main() {
+  const args = parseArgs(process.argv.slice(2));
   if (!args.test262) {
     throw new Error("Pass --test262 <path-to-Test262-checkout>.");
   }
 
   const test262Dir = path.resolve(args.test262);
+  const revision = gitRevision(test262Dir);
+  const pinnedRevision = JSON.parse(fs.readFileSync(PIN_PATH, "utf8")).revision;
+  if (revision === "unknown") {
+    throw new Error(`Test262 checkout must be a Git repository: ${test262Dir}`);
+  }
+  if (revision !== pinnedRevision && !args.allowUnpinned) {
+    throw new Error(
+      `Test262 revision mismatch: expected ${pinnedRevision}, received ${revision}. ` +
+        "Use --allow-unpinned only for exploratory runs.",
+    );
+  }
   const enginePath = path.resolve(
     args.engine || path.join(root, "target", "debug", `js-engine${process.platform === "win32" ? ".exe" : ""}`),
   );
@@ -66,8 +78,10 @@ async function main() {
   }
 
   const report = {
-    test262Revision: gitRevision(test262Dir),
-    engine: "Boa 0.22.0 embedded by js-engine",
+    test262Revision: revision,
+    pinnedRevision,
+    pinMatched: revision === pinnedRevision,
+    engine: "soumen-dey/rust-javascript-engine (from-scratch Rust interpreter)",
     selection: paths,
     scenarios: cases,
     ...counts,
@@ -160,9 +174,19 @@ function gitRevision(directory) {
 }
 
 function parseArgs(argv) {
-  const parsed = { paths: [], test262: null, engine: null, report: null };
+  const parsed = {
+    paths: [],
+    test262: null,
+    engine: null,
+    report: null,
+    allowUnpinned: false,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
+    if (arg === "--allow-unpinned") {
+      parsed.allowUnpinned = true;
+      continue;
+    }
     if (!["--test262", "--engine", "--report", "--path"].includes(arg)) {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -179,7 +203,11 @@ function parseArgs(argv) {
   return parsed;
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack || error}\n`);
-  process.exitCode = 2;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack || error}\n`);
+    process.exitCode = 2;
+  });
+}
+
+module.exports = { parseArgs, skipReason };

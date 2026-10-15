@@ -2,6 +2,7 @@
   "name": "js-engine-conformance",
   "private": true,
   "scripts": {
+    "test": "node --test tests/*.test.cjs",
     "test262": "node tools/test262/run.cjs"
   },
   "devDependencies": {
