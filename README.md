@@ -43,6 +43,13 @@ The interpreter currently supports:
   iterators, and iteration in `for...of` and `Array.from`
 - basic `WeakMap` and `WeakSet` construction and object-keyed lookup/mutation
   methods
+- core `Date` time values, numeric/component/supported ISO-string construction,
+  UTC getters/setters, UTC-based local-time aliases, `setTime`, `Date.now`,
+  `Date.parse`, `Date.UTC`, and ISO output
+- ECMAScript-oriented `RegExp` construction, `test`, `exec` captures and named
+  groups, `d` match indices, Unicode-aware matching, lookarounds, backreferences,
+  supported flags (including `u` and `v`), and global/sticky `lastIndex`
+  tracking, backed by the `regress` engine
 - selected `String`, `Number`, and `Boolean` conversions and prototype methods,
   `Math`, global numeric conversion helpers, and `JSON.parse`/`JSON.stringify`
   with reviver, replacer, and indentation arguments
@@ -64,11 +71,15 @@ the engine's own array and collection iterator objects, but arbitrary
 user-defined iterators are not supported. `for...of` recognizes only the
 runtime's supported built-in collection types. Collection iteration handles
 basic additions and deletions, but the full collection API is not complete.
+The `Date` parser accepts a limited ISO date/time form; local-time methods are
+UTC aliases in this headless runtime, and the complete ECMAScript date-string
+grammar is not implemented.
 `WeakMap` and `WeakSet` enforce object-key requirements but do not provide
 garbage-collection weak-reference behavior because the runtime has no garbage
 collector.
 Some array methods,
-complete string/number behavior, `Date`, `RegExp`, `Symbol`, `BigInt`, `Proxy`,
+complete string/number behavior, RegExp literal parsing and the complete set of
+RegExp/String integration algorithms and edge cases, `Symbol`, `BigInt`, `Proxy`,
 `Reflect`, modules, promises/jobs, and many other specified APIs are not implemented.
 Classes, many constructor edge cases, complete `this` binding rules, and
 complete ECMAScript error objects are also missing. The parser and runtime

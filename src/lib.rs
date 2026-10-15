@@ -142,6 +142,11 @@ enum NativeFunction {
     WeakMapMethod(&'static str),
     WeakSetConstructor,
     WeakSetMethod(&'static str),
+    Date,
+    DateMethod(&'static str),
+    DateStatic(&'static str),
+    RegExp,
+    RegExpMethod(&'static str),
     String,
     StringMethod(&'static str),
     Number,
@@ -180,6 +185,23 @@ struct Object {
     set_data: Option<Vec<Option<Value>>>,
     weak_map_data: Option<Vec<(ObjectId, Value)>>,
     weak_set_data: Option<Vec<ObjectId>>,
+    date_value: Option<f64>,
+    regexp_data: Option<RegExpData>,
+}
+
+#[derive(Clone)]
+struct RegExpData {
+    matcher: regress::Regex,
+    source: String,
+    flags: String,
+    global: bool,
+    has_indices: bool,
+    ignore_case: bool,
+    multiline: bool,
+    dot_all: bool,
+    unicode: bool,
+    unicode_sets: bool,
+    sticky: bool,
 }
 
 #[derive(Clone)]
@@ -252,6 +274,8 @@ pub struct Engine {
     set_prototype: ObjectId,
     weak_map_prototype: ObjectId,
     weak_set_prototype: ObjectId,
+    date_prototype: ObjectId,
+    regexp_prototype: ObjectId,
     string_prototype: ObjectId,
     number_prototype: ObjectId,
     boolean_prototype: ObjectId,
@@ -278,6 +302,8 @@ impl Engine {
             set_prototype: 0,
             weak_map_prototype: 0,
             weak_set_prototype: 0,
+            date_prototype: 0,
+            regexp_prototype: 0,
             string_prototype: 0,
             number_prototype: 0,
             boolean_prototype: 0,
@@ -298,6 +324,8 @@ impl Engine {
         engine.set_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.weak_map_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.weak_set_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.date_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.regexp_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.string_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.number_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.boolean_prototype = engine.alloc_object(Some(engine.object_prototype));
@@ -392,6 +420,8 @@ impl Engine {
         engine.install_primitive_builtins();
         engine.install_math_builtins();
         engine.install_collection_builtins();
+        engine.install_date_builtins();
+        engine.install_regexp_builtins();
         Self::declare_global(&mut engine, "undefined", Value::Undefined, false);
         Self::declare_global(&mut engine, "NaN", Value::Number(f64::NAN), false);
         Self::declare_global(&mut engine, "Infinity", Value::Number(f64::INFINITY), false);
@@ -631,6 +661,110 @@ impl Engine {
             self.set_property(function, "length", Value::Number(*length));
             self.set_builtin_property(prototype, method, Value::Object(function));
         }
+    }
+
+    fn install_date_builtins(&mut self) {
+        let constructor = self.alloc_native(NativeFunction::Date, Some(self.object_prototype));
+        self.set_property(constructor, "name", Value::String("Date".to_owned()));
+        self.set_property(constructor, "length", Value::Number(7.0));
+        self.set_property(constructor, "prototype", Value::Object(self.date_prototype));
+        self.set_builtin_property(
+            self.date_prototype,
+            "constructor",
+            Value::Object(constructor),
+        );
+        for (name, length) in [
+            ("getTime", 0.0),
+            ("valueOf", 0.0),
+            ("getFullYear", 0.0),
+            ("getYear", 0.0),
+            ("getMonth", 0.0),
+            ("getDate", 0.0),
+            ("getDay", 0.0),
+            ("getHours", 0.0),
+            ("getMinutes", 0.0),
+            ("getSeconds", 0.0),
+            ("getMilliseconds", 0.0),
+            ("getTimezoneOffset", 0.0),
+            ("getUTCFullYear", 0.0),
+            ("getUTCMonth", 0.0),
+            ("getUTCDate", 0.0),
+            ("getUTCDay", 0.0),
+            ("getUTCHours", 0.0),
+            ("getUTCMinutes", 0.0),
+            ("getUTCSeconds", 0.0),
+            ("getUTCMilliseconds", 0.0),
+            ("setFullYear", 1.0),
+            ("setUTCFullYear", 1.0),
+            ("setMonth", 1.0),
+            ("setUTCMonth", 1.0),
+            ("setDate", 1.0),
+            ("setUTCDate", 1.0),
+            ("setHours", 1.0),
+            ("setUTCHours", 1.0),
+            ("setMinutes", 1.0),
+            ("setUTCMinutes", 1.0),
+            ("setSeconds", 1.0),
+            ("setUTCSeconds", 1.0),
+            ("setMilliseconds", 1.0),
+            ("setUTCMilliseconds", 1.0),
+            ("setYear", 1.0),
+            ("setTime", 1.0),
+            ("toString", 0.0),
+            ("toDateString", 0.0),
+            ("toTimeString", 0.0),
+            ("toLocaleString", 0.0),
+            ("toLocaleDateString", 0.0),
+            ("toLocaleTimeString", 0.0),
+            ("toUTCString", 0.0),
+            ("toGMTString", 0.0),
+            ("toISOString", 0.0),
+            ("toJSON", 0.0),
+        ] {
+            let function = self.alloc_native(
+                NativeFunction::DateMethod(name),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(length));
+            self.set_builtin_property(self.date_prototype, name, Value::Object(function));
+        }
+        for (name, length) in [("now", 0.0), ("parse", 1.0), ("UTC", 7.0)] {
+            let function = self.alloc_native(
+                NativeFunction::DateStatic(name),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(length));
+            self.set_property(constructor, name, Value::Object(function));
+        }
+        self.declare_global("Date", Value::Object(constructor), false);
+    }
+
+    fn install_regexp_builtins(&mut self) {
+        let constructor = self.alloc_native(NativeFunction::RegExp, Some(self.object_prototype));
+        self.set_property(constructor, "name", Value::String("RegExp".to_owned()));
+        self.set_property(constructor, "length", Value::Number(2.0));
+        self.set_property(
+            constructor,
+            "prototype",
+            Value::Object(self.regexp_prototype),
+        );
+        self.set_builtin_property(
+            self.regexp_prototype,
+            "constructor",
+            Value::Object(constructor),
+        );
+        for (name, length) in [("exec", 1.0), ("test", 1.0), ("toString", 0.0)] {
+            let function = self.alloc_native(
+                NativeFunction::RegExpMethod(name),
+                Some(self.object_prototype),
+            );
+            self.set_property(function, "name", Value::String(name.to_owned()));
+            self.set_property(function, "length", Value::Number(length));
+            self.set_builtin_property(self.regexp_prototype, name, Value::Object(function));
+        }
+        self.declare_global("RegExp", Value::Object(constructor), false);
     }
 
     fn install_collection_prototype(
@@ -2597,6 +2731,8 @@ impl Engine {
                         | NativeFunction::SetConstructor
                         | NativeFunction::WeakMapConstructor
                         | NativeFunction::WeakSetConstructor
+                        | NativeFunction::Date
+                        | NativeFunction::RegExp
                 ))
         )
     }
@@ -3227,6 +3363,82 @@ impl Engine {
             }
             NativeFunction::WeakSetMethod(method) => {
                 self.call_weak_set_method(method, this_value, arguments)
+            }
+            NativeFunction::Date => {
+                if let Value::Object(date) = this_value {
+                    let time = match arguments.first() {
+                        None => current_time_value(),
+                        Some(Value::String(input)) if arguments.len() == 1 => {
+                            parse_date_string(input)
+                                .map(|time| time as f64)
+                                .unwrap_or(f64::NAN)
+                        }
+                        Some(value) if arguments.len() == 1 => time_clip(value.to_number()),
+                        Some(_) => date_from_components(&arguments),
+                    };
+                    self.objects[date].date_value = Some(time);
+                    Ok(Value::Object(date))
+                } else {
+                    Ok(Value::String(format_date_string(current_time_value())))
+                }
+            }
+            NativeFunction::DateMethod(method) => {
+                self.call_date_method(method, this_value, arguments)
+            }
+            NativeFunction::DateStatic(method) => self.call_date_static(method, arguments),
+            NativeFunction::RegExp => {
+                let regexp = if let Value::Object(regexp) = this_value {
+                    regexp
+                } else if let Some(Value::Object(existing)) = arguments.first()
+                    && self.objects[*existing].regexp_data.is_some()
+                    && arguments
+                        .get(1)
+                        .is_none_or(|value| matches!(value, Value::Undefined))
+                {
+                    return Ok(Value::Object(*existing));
+                } else {
+                    self.alloc_object(Some(self.regexp_prototype))
+                };
+                let (pattern, flags) = match arguments.first() {
+                    Some(Value::Object(pattern_id))
+                        if let Some(data) = self.objects[*pattern_id].regexp_data.as_ref() =>
+                    {
+                        (
+                            data.source.clone(),
+                            arguments
+                                .get(1)
+                                .filter(|value| !matches!(value, Value::Undefined))
+                                .map(|value| self.to_string(value))
+                                .unwrap_or_else(|| data.flags.clone()),
+                        )
+                    }
+                    Some(Value::Undefined) | None => (String::new(), String::new()),
+                    Some(value) => (
+                        self.to_string(value),
+                        arguments
+                            .get(1)
+                            .filter(|flags| !matches!(flags, Value::Undefined))
+                            .map(|flags| self.to_string(flags))
+                            .unwrap_or_default(),
+                    ),
+                };
+                let data = build_regexp(pattern, flags)?;
+                self.objects[regexp].regexp_data = Some(data.clone());
+                self.set_property(regexp, "source", Value::String(regexp_source(&data.source)));
+                self.set_property(regexp, "flags", Value::String(data.flags.clone()));
+                self.set_property(regexp, "global", Value::Boolean(data.global));
+                self.set_property(regexp, "hasIndices", Value::Boolean(data.has_indices));
+                self.set_property(regexp, "ignoreCase", Value::Boolean(data.ignore_case));
+                self.set_property(regexp, "multiline", Value::Boolean(data.multiline));
+                self.set_property(regexp, "dotAll", Value::Boolean(data.dot_all));
+                self.set_property(regexp, "unicode", Value::Boolean(data.unicode));
+                self.set_property(regexp, "unicodeSets", Value::Boolean(data.unicode_sets));
+                self.set_property(regexp, "sticky", Value::Boolean(data.sticky));
+                self.set_property(regexp, "lastIndex", Value::Number(0.0));
+                Ok(Value::Object(regexp))
+            }
+            NativeFunction::RegExpMethod(method) => {
+                self.call_regexp_method(method, this_value, arguments)
             }
             NativeFunction::String => Ok(Value::String(
                 arguments
@@ -4250,6 +4462,320 @@ impl Engine {
             }
             _ => unreachable!("known WeakSet method"),
         }
+    }
+
+    fn call_date_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        let Value::Object(date) = this_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Date method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        let Some(time) = self.objects[date].date_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Date method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        match method {
+            "getTime" | "valueOf" => Ok(Value::Number(time)),
+            "toString" | "toLocaleString" => Ok(Value::String(format_date_string(time))),
+            "toDateString" | "toLocaleDateString" => Ok(Value::String(format_date_only(time))),
+            "toTimeString" | "toLocaleTimeString" => Ok(Value::String(format_time_only(time))),
+            "toUTCString" | "toGMTString" => Ok(Value::String(format_utc_string(time))),
+            "setTime" => {
+                let time = time_clip(arguments.first().map(Value::to_number).unwrap_or(f64::NAN));
+                self.objects[date].date_value = Some(time);
+                Ok(Value::Number(time))
+            }
+            "setFullYear" | "setUTCFullYear" | "setYear" | "setMonth" | "setUTCMonth"
+            | "setDate" | "setUTCDate" | "setHours" | "setUTCHours" | "setMinutes"
+            | "setUTCMinutes" | "setSeconds" | "setUTCSeconds" | "setMilliseconds"
+            | "setUTCMilliseconds" => {
+                if arguments.is_empty() {
+                    self.objects[date].date_value = Some(f64::NAN);
+                    return Ok(Value::Number(f64::NAN));
+                }
+                let recovers_invalid =
+                    matches!(method, "setFullYear" | "setUTCFullYear" | "setYear");
+                let parts = date_parts(if time.is_finite() { time } else { 0.0 });
+                if !time.is_finite() && !recovers_invalid {
+                    self.objects[date].date_value = Some(f64::NAN);
+                    return Ok(Value::Number(f64::NAN));
+                }
+                let mut components = [
+                    parts.year,
+                    parts.month as i64 - 1,
+                    parts.day as i64,
+                    parts.hour as i64,
+                    parts.minute as i64,
+                    parts.second as i64,
+                    parts.millisecond as i64,
+                ];
+                let component_indexes: &[usize] = match method {
+                    "setFullYear" | "setUTCFullYear" | "setYear" => &[0, 1, 2],
+                    "setMonth" | "setUTCMonth" => &[1, 2],
+                    "setDate" | "setUTCDate" => &[2],
+                    "setHours" | "setUTCHours" => &[3, 4, 5, 6],
+                    "setMinutes" | "setUTCMinutes" => &[4, 5, 6],
+                    "setSeconds" | "setUTCSeconds" => &[5, 6],
+                    "setMilliseconds" | "setUTCMilliseconds" => &[6],
+                    _ => unreachable!("known Date setter"),
+                };
+                for (argument_index, component_index) in component_indexes.iter().enumerate() {
+                    let Some(value) = arguments.get(argument_index) else {
+                        break;
+                    };
+                    let number = value.to_number();
+                    if !number.is_finite() {
+                        self.objects[date].date_value = Some(f64::NAN);
+                        return Ok(Value::Number(f64::NAN));
+                    }
+                    components[*component_index] = number.trunc() as i64;
+                }
+                if method == "setYear" {
+                    let year = components[0];
+                    components[0] = if (0..=99).contains(&year) {
+                        year + 1900
+                    } else {
+                        year
+                    };
+                }
+                let updated = make_date_value(components);
+                self.objects[date].date_value = Some(updated);
+                Ok(Value::Number(updated))
+            }
+            "toISOString" => {
+                if !time.is_finite() {
+                    return Err(EngineError::new("RangeError", "Invalid time value", 1, 1));
+                }
+                Ok(Value::String(format_iso_date(time)))
+            }
+            "toJSON" => {
+                if !time.is_finite() {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::String(format_iso_date(time)))
+                }
+            }
+            "getTimezoneOffset" => Ok(Value::Number(if time.is_finite() { 0.0 } else { f64::NAN })),
+            "getFullYear" | "getYear" | "getMonth" | "getDate" | "getDay" | "getHours"
+            | "getMinutes" | "getSeconds" | "getMilliseconds" | "getUTCFullYear"
+            | "getUTCMonth" | "getUTCDate" | "getUTCDay" | "getUTCHours" | "getUTCMinutes"
+            | "getUTCSeconds" | "getUTCMilliseconds" => {
+                if !time.is_finite() {
+                    return Ok(Value::Number(f64::NAN));
+                }
+                let parts = date_parts(time);
+                let value = match method {
+                    "getFullYear" | "getUTCFullYear" => parts.year as f64,
+                    "getYear" => parts.year as f64 - 1900.0,
+                    "getMonth" | "getUTCMonth" => parts.month as f64 - 1.0,
+                    "getDate" | "getUTCDate" => parts.day as f64,
+                    "getDay" | "getUTCDay" => parts.weekday as f64,
+                    "getHours" | "getUTCHours" => parts.hour as f64,
+                    "getMinutes" | "getUTCMinutes" => parts.minute as f64,
+                    "getSeconds" | "getUTCSeconds" => parts.second as f64,
+                    "getMilliseconds" | "getUTCMilliseconds" => parts.millisecond as f64,
+                    _ => unreachable!("known Date getter"),
+                };
+                Ok(Value::Number(value))
+            }
+            _ => unreachable!("known Date method"),
+        }
+    }
+
+    fn call_date_static(&self, method: &str, arguments: Vec<Value>) -> Result<Value, EngineError> {
+        match method {
+            "now" => Ok(Value::Number(current_time_value())),
+            "parse" => Ok(Value::Number(
+                arguments
+                    .first()
+                    .map(Value::to_js_string)
+                    .and_then(|input| parse_date_string(&input))
+                    .map(|time| time as f64)
+                    .unwrap_or(f64::NAN),
+            )),
+            "UTC" => {
+                if arguments.is_empty() {
+                    return Ok(Value::Number(f64::NAN));
+                }
+                let mut components = [0i64, 0, 1, 0, 0, 0, 0];
+                for (index, value) in arguments.iter().take(7).enumerate() {
+                    let number = value.to_number();
+                    if !number.is_finite() {
+                        return Ok(Value::Number(f64::NAN));
+                    }
+                    components[index] = number.trunc() as i64;
+                }
+                if arguments.len() < 2 {
+                    components[1] = 0;
+                }
+                let year = components[0];
+                components[0] = if (0..=99).contains(&year) {
+                    year + 1900
+                } else {
+                    year
+                };
+                let time = make_date_value(components);
+                Ok(Value::Number(time))
+            }
+            _ => unreachable!("known Date static method"),
+        }
+    }
+
+    fn call_regexp_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        let Value::Object(regexp) = this_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "RegExp method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        let Some(data) = self.objects[regexp].regexp_data.clone() else {
+            return Err(EngineError::new(
+                "TypeError",
+                "RegExp method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        if method == "toString" {
+            return Ok(Value::String(format!(
+                "/{}/{}",
+                regexp_source(&data.source),
+                data.flags
+            )));
+        }
+        let input = arguments
+            .first()
+            .map(|value| self.to_string(value))
+            .unwrap_or_else(|| "undefined".to_owned());
+        let last_index = if data.global || data.sticky {
+            self.get_own_property(regexp, "lastIndex")
+                .unwrap_or(Value::Number(0.0))
+                .to_number()
+        } else {
+            0.0
+        };
+        let start = if last_index.is_nan() || last_index <= 0.0 {
+            0
+        } else if last_index.is_finite() {
+            last_index.trunc() as usize
+        } else {
+            usize::MAX
+        };
+        let input_utf16: Vec<u16> = input.encode_utf16().collect();
+        let matched: Option<regress::Match> = if start <= input_utf16.len() {
+            let found = if data.unicode || data.unicode_sets {
+                data.matcher.find_from_utf16(&input_utf16, start).next()
+            } else {
+                data.matcher.find_from_ucs2(&input_utf16, start).next()
+            };
+            found.filter(|found| !data.sticky || found.start() == start)
+        } else {
+            None
+        };
+        let Some(found) = matched else {
+            if data.global || data.sticky {
+                self.set_property(regexp, "lastIndex", Value::Number(0.0));
+            }
+            return Ok(if method == "test" {
+                Value::Boolean(false)
+            } else {
+                Value::Null
+            });
+        };
+        let start = found.start();
+        let end = found.end();
+        if data.global || data.sticky {
+            self.set_property(regexp, "lastIndex", Value::Number(end as f64));
+        }
+        if method == "test" {
+            return Ok(Value::Boolean(true));
+        }
+        let result = self.alloc_array();
+        let capture_count = found.captures.len() + 1;
+        for index in 0..capture_count {
+            let value = found
+                .group(index)
+                .map(|range| Value::String(String::from_utf16_lossy(&input_utf16[range])))
+                .unwrap_or(Value::Undefined);
+            self.set_property(result, &index.to_string(), value);
+        }
+        self.set_property(result, "index", Value::Number(start as f64));
+        self.set_property(result, "input", Value::String(input));
+        let named_groups = found
+            .named_groups()
+            .map(|(name, range)| (name.to_owned(), range))
+            .collect::<Vec<_>>();
+        if named_groups.is_empty() {
+            self.set_property(result, "groups", Value::Undefined);
+        } else {
+            let groups = self.alloc_object(Some(self.object_prototype));
+            for (name, range) in named_groups {
+                let value = range
+                    .map(|range| Value::String(String::from_utf16_lossy(&input_utf16[range])))
+                    .unwrap_or(Value::Undefined);
+                self.set_property(groups, &name, value);
+            }
+            self.set_property(result, "groups", Value::Object(groups));
+        }
+        if data.has_indices {
+            let indices = self.alloc_array();
+            for index in 0..capture_count {
+                let pair = found.group(index).map(|range| {
+                    let pair = self.alloc_array();
+                    self.set_property(pair, "0", Value::Number(range.start as f64));
+                    self.set_property(pair, "1", Value::Number(range.end as f64));
+                    Value::Object(pair)
+                });
+                self.set_property(
+                    indices,
+                    &index.to_string(),
+                    pair.unwrap_or(Value::Undefined),
+                );
+            }
+            let groups = self.alloc_object(Some(self.object_prototype));
+            let mut has_named_groups = false;
+            for (name, range) in found.named_groups() {
+                has_named_groups = true;
+                let value = range
+                    .map(|range| {
+                        let pair = self.alloc_array();
+                        self.set_property(pair, "0", Value::Number(range.start as f64));
+                        self.set_property(pair, "1", Value::Number(range.end as f64));
+                        Value::Object(pair)
+                    })
+                    .unwrap_or(Value::Undefined);
+                self.set_property(groups, name, value);
+            }
+            let groups = if has_named_groups {
+                Value::Object(groups)
+            } else {
+                Value::Undefined
+            };
+            self.set_property(indices, "groups", groups);
+            self.set_property(result, "indices", Value::Object(indices));
+        } else {
+            self.set_property(result, "indices", Value::Undefined);
+        }
+        Ok(Value::Object(result))
     }
 
     fn argument_list_values(&self, list: Value) -> Result<Vec<Value>, EngineError> {
@@ -5909,6 +6435,351 @@ fn same_value(left: &Value, right: &Value) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DateParts {
+    year: i64,
+    month: u32,
+    day: u32,
+    weekday: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    millisecond: u32,
+}
+
+fn current_time_value() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+fn build_regexp(pattern: String, flags: String) -> Result<RegExpData, EngineError> {
+    let mut seen = HashSet::new();
+    for flag in flags.chars() {
+        if !matches!(flag, 'd' | 'g' | 'i' | 'm' | 's' | 'u' | 'v' | 'y') || !seen.insert(flag) {
+            return Err(EngineError::new(
+                "SyntaxError",
+                format!("Invalid regular expression flag '{flag}'"),
+                1,
+                1,
+            ));
+        }
+    }
+    if seen.contains(&'u') && seen.contains(&'v') {
+        return Err(EngineError::new(
+            "SyntaxError",
+            "The 'u' and 'v' flags cannot be used together",
+            1,
+            1,
+        ));
+    }
+    let canonical_flags: String = "dgimsuvy"
+        .chars()
+        .filter(|flag| seen.contains(flag))
+        .collect();
+    let source = if pattern.is_empty() {
+        "(?:)".to_owned()
+    } else {
+        pattern
+    };
+    let matcher_flags = regress::Flags {
+        icase: seen.contains(&'i'),
+        multiline: seen.contains(&'m'),
+        dot_all: seen.contains(&'s'),
+        unicode: seen.contains(&'u'),
+        unicode_sets: seen.contains(&'v'),
+        ..regress::Flags::default()
+    };
+    let matcher = regress::Regex::with_flags(&source, matcher_flags).map_err(|error| {
+        EngineError::new(
+            "SyntaxError",
+            format!("Invalid regular expression: {error}"),
+            1,
+            1,
+        )
+    })?;
+    Ok(RegExpData {
+        matcher,
+        source,
+        flags: canonical_flags,
+        global: seen.contains(&'g'),
+        has_indices: seen.contains(&'d'),
+        ignore_case: seen.contains(&'i'),
+        multiline: seen.contains(&'m'),
+        dot_all: seen.contains(&'s'),
+        unicode: seen.contains(&'u'),
+        unicode_sets: seen.contains(&'v'),
+        sticky: seen.contains(&'y'),
+    })
+}
+
+fn regexp_source(pattern: &str) -> String {
+    let mut source = String::with_capacity(pattern.len());
+    let mut backslashes = 0;
+    for character in pattern.chars() {
+        match character {
+            '/' if backslashes % 2 == 0 => source.push_str("\\/"),
+            '\n' => source.push_str("\\n"),
+            '\r' => source.push_str("\\r"),
+            '\u{2028}' => source.push_str("\\u2028"),
+            '\u{2029}' => source.push_str("\\u2029"),
+            _ => source.push(character),
+        }
+        if character == '\\' {
+            backslashes += 1;
+        } else {
+            backslashes = 0;
+        }
+    }
+    source
+}
+
+fn time_clip(time: f64) -> f64 {
+    if !time.is_finite() || time.abs() > 8.64e15 {
+        f64::NAN
+    } else {
+        time.trunc()
+    }
+}
+
+fn days_from_civil(year: i128, month: i128, day: i128) -> i128 {
+    let year = year - i128::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
+fn date_parts(time: f64) -> DateParts {
+    let milliseconds = time as i64;
+    let days = milliseconds.div_euclid(86_400_000);
+    let time_of_day = milliseconds.rem_euclid(86_400_000) as u32;
+    let (year, month, day) = civil_from_days(days);
+    DateParts {
+        year,
+        month,
+        day,
+        weekday: (days + 4).rem_euclid(7) as u32,
+        hour: time_of_day / 3_600_000,
+        minute: (time_of_day / 60_000) % 60,
+        second: (time_of_day / 1_000) % 60,
+        millisecond: time_of_day % 1_000,
+    }
+}
+
+fn make_date_value(components: [i64; 7]) -> f64 {
+    let mut components = components.map(i128::from);
+    let month_adjustment = components[1].div_euclid(12);
+    components[0] += month_adjustment;
+    let month = components[1].rem_euclid(12) + 1;
+    let days = days_from_civil(components[0], month, components[2]);
+    let time = days as f64 * 86_400_000.0
+        + components[3] as f64 * 3_600_000.0
+        + components[4] as f64 * 60_000.0
+        + components[5] as f64 * 1_000.0
+        + components[6] as f64;
+    time_clip(time)
+}
+
+fn date_from_components(arguments: &[Value]) -> f64 {
+    let mut components = [0i64, 0, 1, 0, 0, 0, 0];
+    for (index, value) in arguments.iter().take(7).enumerate() {
+        let number = value.to_number();
+        if !number.is_finite() {
+            return f64::NAN;
+        }
+        components[index] = number.trunc() as i64;
+    }
+    let year = components[0];
+    components[0] = if (0..=99).contains(&year) {
+        year + 1900
+    } else {
+        year
+    };
+    make_date_value(components)
+}
+
+fn parse_fixed_digits(input: &str, start: usize, length: usize) -> Option<i64> {
+    let text = input.get(start..start + length)?;
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+fn parse_date_string(input: &str) -> Option<i64> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 10 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let year = parse_fixed_digits(input, 0, 4)?;
+    let month = parse_fixed_digits(input, 5, 2)?;
+    let day = parse_fixed_digits(input, 8, 2)?;
+    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
+    let mut components = [year, month - 1, day, 0, 0, 0, 0];
+    if bytes.len() > 10 {
+        if !matches!(bytes.get(10), Some(b'T' | b't' | b' ')) {
+            return None;
+        }
+        components[3] = parse_fixed_digits(input, 11, 2)?;
+        if bytes.get(13) != Some(&b':') {
+            return None;
+        }
+        components[4] = parse_fixed_digits(input, 14, 2)?;
+        if bytes.get(16) != Some(&b':') {
+            return None;
+        }
+        components[5] = parse_fixed_digits(input, 17, 2)?;
+        if components[3] > 24
+            || components[4] > 59
+            || components[5] > 59
+            || (components[3] == 24 && (components[4] != 0 || components[5] != 0))
+        {
+            return None;
+        }
+        let mut offset = 19;
+        if bytes.get(offset) == Some(&b'.') {
+            offset += 1;
+            let start = offset;
+            while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+                offset += 1;
+            }
+            if start == offset {
+                return None;
+            }
+            let fraction = input.get(start..offset)?;
+            let digits = fraction.chars().take(3).collect::<String>();
+            let millis = digits.parse::<i64>().ok()?;
+            components[6] = millis * 10_i64.pow(3_u32.saturating_sub(digits.len() as u32));
+        }
+        let timezone_minutes = match bytes.get(offset) {
+            Some(b'Z' | b'z') if offset + 1 == bytes.len() => 0,
+            Some(sign @ (b'+' | b'-')) => {
+                let hours = parse_fixed_digits(input, offset + 1, 2)?;
+                if bytes.get(offset + 3) != Some(&b':') {
+                    return None;
+                }
+                let minutes = parse_fixed_digits(input, offset + 4, 2)?;
+                if hours > 23 || minutes > 59 || offset + 6 != bytes.len() {
+                    return None;
+                }
+                let amount = hours * 60 + minutes;
+                if *sign == b'+' { amount } else { -amount }
+            }
+            None if offset == bytes.len() => 0,
+            _ => return None,
+        };
+        let time = time_clip(make_date_value(components) - timezone_minutes as f64 * 60_000.0);
+        return time.is_finite().then_some(time as i64);
+    }
+    let time = make_date_value(components);
+    time.is_finite().then_some(time as i64)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year.rem_euclid(4) == 0
+            && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0) =>
+        {
+            29
+        }
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn format_iso_date(time: f64) -> String {
+    let parts = date_parts(time);
+    let year = if (0..=9999).contains(&parts.year) {
+        format!("{:04}", parts.year)
+    } else {
+        format!("{:+07}", parts.year)
+    };
+    format!(
+        "{year}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        parts.month, parts.day, parts.hour, parts.minute, parts.second, parts.millisecond
+    )
+}
+
+fn format_date_string(time: f64) -> String {
+    if time.is_finite() {
+        format!("{} {}", format_date_only(time), format_time_only(time))
+    } else {
+        "Invalid Date".to_owned()
+    }
+}
+
+fn format_date_only(time: f64) -> String {
+    if !time.is_finite() {
+        return "Invalid Date".to_owned();
+    }
+    let parts = date_parts(time);
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{} {} {:02} {}",
+        WEEKDAYS[parts.weekday as usize],
+        MONTHS[parts.month as usize - 1],
+        parts.day,
+        parts.year
+    )
+}
+
+fn format_time_only(time: f64) -> String {
+    if !time.is_finite() {
+        return "Invalid Date".to_owned();
+    }
+    let parts = date_parts(time);
+    format!(
+        "{:02}:{:02}:{:02} GMT+0000 (UTC)",
+        parts.hour, parts.minute, parts.second
+    )
+}
+
+fn format_utc_string(time: f64) -> String {
+    if !time.is_finite() {
+        return "Invalid Date".to_owned();
+    }
+    let parts = date_parts(time);
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        WEEKDAYS[parts.weekday as usize],
+        parts.day,
+        MONTHS[parts.month as usize - 1],
+        parts.year,
+        parts.hour,
+        parts.minute,
+        parts.second
+    )
+}
+
 struct JsonParser<'a> {
     input: &'a str,
     offset: usize,
@@ -6834,6 +7705,226 @@ mod tests {
         assert_eq!(
             engine.eval("new WeakSet().add(1)").unwrap_err().name,
             "TypeError"
+        );
+    }
+
+    #[test]
+    fn date_supports_time_values_iso_dates_and_utc_components() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let epochDate = new Date(0); epochDate.toISOString() + ':' + epochDate.getUTCFullYear() + ':' + epochDate.getUTCMonth() + ':' + epochDate.getUTCDay()",
+                )
+                .unwrap(),
+            "1970-01-01T00:00:00.000Z:1970:0:4"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let parsedDate = new Date('2020-02-29T12:34:56.789Z'); parsedDate.toISOString() + ':' + parsedDate.getUTCDate() + ':' + parsedDate.getUTCHours() + ':' + parsedDate.getUTCMilliseconds()",
+                )
+                .unwrap(),
+            "2020-02-29T12:34:56.789Z:29:12:789"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "Date.parse('1970-01-01T01:00:00+01:00') + ':' + Date.UTC(2000, 0, 1) + ':' + Date.UTC(99, 0, 1)",
+                )
+                .unwrap(),
+            "0:946684800000:915148800000"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let mutableDate = new Date(1.9); mutableDate.setTime(42.9) + ':' + mutableDate.valueOf() + ':' + mutableDate.toJSON()",
+                )
+                .unwrap(),
+            "42:42:1970-01-01T00:00:00.042Z"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let componentDate = new Date(2024, 1, 29, 12, 30, 45, 6); componentDate.toISOString() + ':' + componentDate.getFullYear() + ':' + componentDate.getMonth() + ':' + componentDate.getYear()",
+                )
+                .unwrap(),
+            "2024-02-29T12:30:45.006Z:2024:1:124"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "componentDate.setUTCMonth(12, 1); componentDate.toISOString() + ':' + componentDate.setUTCHours(25)",
+                )
+                .unwrap(),
+            "2025-01-01T12:30:45.006Z:1735781445006"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let invalidDate = new Date(NaN); invalidDate.setUTCFullYear(2000); invalidDate.toISOString()",
+                )
+                .unwrap(),
+            "2000-01-01T00:00:00.000Z"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("new Date(2023, 0, 1, 0, 0, 0, 1000).toISOString()")
+                .unwrap(),
+            "2023-01-01T00:00:01.000Z"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let formatDate = new Date(0); formatDate.toString() + '|' + formatDate.toDateString() + '|' + formatDate.toTimeString() + '|' + formatDate.toUTCString() + '|' + formatDate.getTimezoneOffset()",
+                )
+                .unwrap(),
+            "Thu Jan 01 1970 00:00:00 GMT+0000 (UTC)|Thu Jan 01 1970|00:00:00 GMT+0000 (UTC)|Thu, 01 Jan 1970 00:00:00 GMT|0"
+        );
+        assert_eq!(
+            engine.eval("isNaN(Date.parse('2021-02-29'))").unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            engine.eval("new Date(NaN).toISOString()").unwrap_err().name,
+            "RangeError"
+        );
+        assert_eq!(
+            engine
+                .eval("Date.prototype.getTime.call({})")
+                .unwrap_err()
+                .name,
+            "TypeError"
+        );
+        assert!(engine.eval("Date.now() >= 0").unwrap().is_truthy());
+    }
+
+    #[test]
+    fn regular_expressions_support_matching_captures_flags_and_global_state() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let matcher = new RegExp('(ab)(c)?', 'ig'); let capture = matcher.exec('xxAB'); capture[0] + ':' + capture[1] + ':' + capture[2] + ':' + capture.index + ':' + matcher.lastIndex + ':' + matcher.flags + ':' + matcher.toString()",
+                )
+                .unwrap(),
+            "AB:AB:undefined:2:4:gi:/(ab)(c)?/gi"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "matcher.lastIndex = 0; matcher.test('xxab') + ':' + matcher.lastIndex + ':' + matcher.test('no') + ':' + matcher.lastIndex",
+                )
+                .unwrap(),
+            "true:4:false:0"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let stickyMatcher = new RegExp('a+', 'y'); stickyMatcher.lastIndex = 1; stickyMatcher.exec('baa')[0] + ':' + stickyMatcher.lastIndex + ':' + stickyMatcher.test('baa')",
+                )
+                .unwrap(),
+            "aa:3:false"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("new RegExp('x', 'mi').flags + ':' + new RegExp('').source")
+                .unwrap(),
+            "im:(?:)"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let originalPattern = new RegExp('a/b', 'i'); let clonedPattern = new RegExp(originalPattern, 'gi'); clonedPattern.source + ':' + clonedPattern.flags + ':' + clonedPattern.test('A/B')",
+                )
+                .unwrap(),
+            "a\\/b:gi:true"
+        );
+        assert_eq!(
+            engine.eval("new RegExp('x', 'gg')").unwrap_err().name,
+            "SyntaxError"
+        );
+        assert_eq!(
+            engine.eval("new RegExp('(')").unwrap_err().name,
+            "SyntaxError"
+        );
+        assert_eq!(
+            engine
+                .eval("RegExp.prototype.exec.call({}, 'x')")
+                .unwrap_err()
+                .name,
+            "TypeError"
+        );
+    }
+
+    #[test]
+    fn regular_expressions_cover_ecmascript_groups_lookarounds_unicode_and_indices() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let namedMatch = new RegExp('(?<letters>[A-Z]+)(?=!)', 'd').exec('xxABC!'); namedMatch.groups.letters + ':' + namedMatch.indices[0].join('-') + ':' + namedMatch.indices.groups.letters.join('-')",
+                )
+                .unwrap(),
+            "ABC:2-5:2-5"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let optionalMatch = new RegExp('(?<left>a)?(b)', 'd').exec('b'); optionalMatch[1] + ':' + optionalMatch.groups.left + ':' + optionalMatch.indices[1] + ':' + optionalMatch.indices.groups.left",
+                )
+                .unwrap(),
+            "undefined:undefined:undefined:undefined"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("new RegExp('(?<=#)([a-z]+)-\\\\1').exec('#cat-cat')[0]",)
+                .unwrap(),
+            "cat-cat"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "new RegExp('\\\\p{Script=Greek}+', 'u').test('αβ') + ':' + new RegExp('[[A-Z]&&[B-D]]+', 'v').test('BCDF')",
+                )
+                .unwrap(),
+            "true:true"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let unicodeSticky = new RegExp('.', 'uy'); let unicodeResult = unicodeSticky.exec('😀'); unicodeResult[0] + ':' + unicodeSticky.lastIndex",
+                )
+                .unwrap(),
+            "😀:2"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("let legacySticky = new RegExp('.', 'y'); legacySticky.exec('😀'); legacySticky.lastIndex")
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            engine.eval("new RegExp('a', 'uv')").unwrap_err().name,
+            "SyntaxError"
+        );
+        assert_eq!(
+            engine.eval("RegExp('x') === RegExp('x')").unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            engine
+                .eval("let reusableRegExp = new RegExp('x'); RegExp(reusableRegExp) === reusableRegExp")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let negativeLastIndex = new RegExp('a', 'g'); negativeLastIndex.lastIndex = -1; negativeLastIndex.exec('a')[0] + ':' + negativeLastIndex.lastIndex",
+                )
+                .unwrap(),
+            "a:1"
         );
     }
 
