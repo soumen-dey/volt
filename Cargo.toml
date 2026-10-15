@@ -2,7 +2,7 @@
 name = "js-engine"
 version = "0.1.0"
 edition = "2024"
-description = "An embeddable headless ECMAScript runtime backed by Boa"
+description = "A from-scratch headless JavaScript interpreter in Rust"
 
 [lib]
 name = "js_engine"
@@ -11,6 +11,3 @@ path = "src/lib.rs"
 [[bin]]
 name = "js-engine"
 path = "src/main.rs"
-
-[dependencies]
-boa_engine = { version = "0.22.0", features = ["intl_bundled"] }

@@ -20,21 +20,8 @@ fn main() {
             evaluate_source(&source, "<eval>");
         }
         Some("-m") | Some("--module") => {
-            let Some(path) = args.next() else {
-                eprintln!("Usage error: --module requires a file path");
-                process::exit(2);
-            };
-            let mut engine = js_engine::Engine::new();
-            if let Err(error) = evaluate_module_file(&mut engine, &path) {
-                eprintln!("{error}");
-                process::exit(1);
-            }
-            for path in args {
-                if let Err(error) = evaluate_module_file(&mut engine, &path) {
-                    eprintln!("{error}");
-                    process::exit(1);
-                }
-            }
+            eprintln!("Modules are not implemented yet.");
+            process::exit(2);
         }
         Some(arg) if arg.starts_with('-') => {
             eprintln!("Unknown option: {arg}");
@@ -63,10 +50,6 @@ fn evaluate_source(source: &str, name: &str) {
     match engine.eval_to_string(source) {
         Ok(value) => {
             println!("{value}");
-            if let Err(error) = engine.run_jobs() {
-                eprintln!("{name}: {error}");
-                process::exit(1);
-            }
         }
         Err(error) => {
             eprintln!("{name}: {error}");
@@ -90,15 +73,7 @@ fn evaluate_file(engine: &mut js_engine::Engine, path: &str) -> Result<(), Strin
         .eval_to_string(&source)
         .map_err(|error| format!("{path}: {error}"))?;
     println!("{value}");
-    engine
-        .run_jobs()
-        .map_err(|error| format!("{path}: {error}"))
-}
-
-fn evaluate_module_file(engine: &mut js_engine::Engine, path: &str) -> Result<(), String> {
-    engine
-        .eval_module_file(path)
-        .map_err(|error| format!("{path}: {error}"))
+    Ok(())
 }
 
 fn print_help() {
@@ -108,14 +83,15 @@ fn print_help() {
          Usage:\n\
            js-engine [OPTIONS] [FILE...]\n\
            js-engine --eval <SOURCE>\n\
-           js-engine --module <FILE...>\n\
+           js-engine --module <FILE...>  (not implemented yet)\n\
            js-engine < script.js\n\n\
          Options:\n\
            -e, --eval <SOURCE>  Evaluate JavaScript source\n\
            -m, --module <FILE>  Evaluate module file(s) with imports\n\
            -h, --help           Print this help\n\
            -V, --version        Print version\n\n\
-         Files are evaluated in order in one persistent JavaScript context.",
+         Files are evaluated in order in one persistent JavaScript context.\n\
+         Only the language subset documented in the README is implemented.",
         env!("CARGO_PKG_VERSION")
     );
 }
