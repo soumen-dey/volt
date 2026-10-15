@@ -1,0 +1,10 @@
+{
+  "name": "js-engine-conformance",
+  "private": true,
+  "scripts": {
+    "test262": "node tools/test262/run.cjs"
+  },
+  "devDependencies": {
+    "test262-stream": "^1.4.0"
+  }
+}

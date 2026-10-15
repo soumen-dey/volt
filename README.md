@@ -59,15 +59,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The desired target is the current ECMAScript 2026 specification, but the
 runtime has not yet been validated against the official
 [Test262](https://github.com/tc39/test262) suite. In particular, this
-repository does not yet have a Test262 runner, an edition-aware feature
-baseline, or recorded pass/fail results. Do not treat the current built-in
-smoke tests or Boa's version number as proof of ES2026 support.
+repository does not yet have an edition-aware feature baseline or recorded
+full-suite pass/fail results. Do not treat the current built-in smoke tests or
+Boa's version number as proof of ES2026 support.
 
-The next conformance milestone is to integrate a reproducible Test262 run,
-record the exact Test262 revision and runner configuration, and publish
-pass/fail/skip counts. Implementations should then be driven by those failures
-and the ES2026 specification. Until that work is complete, this is an
-experimental headless runtime, not a complete or certified ES2026 engine.
+An initial Test262 runner is available. It uses the official
+`test262-stream` package to load tests, metadata, strict-mode variants, and
+assertion includes, then starts a fresh engine process for each test scenario.
+The runner skips asynchronous tests, modules, and tests that require
+Test262-specific realm, `evalScript`, agent, detach, or garbage-collection
+host hooks that this runtime does not provide. Expected negative tests are
+checked for a nonzero exit and the specified error name; the runner does not
+independently verify the exact Test262 parse/resolution/runtime phase.
+
+To run it, first obtain a Test262 checkout and build the engine:
+
+```text
+git clone --depth 1 https://github.com/tc39/test262.git path\to\test262
+cargo build --locked
+npm ci
+npm run test262 -- --test262 path\to\test262 --report test262-results.json
+```
+
+Use repeated `--path` arguments to run a smaller test selection, for example
+`--path test/language --path test/built-ins`. Reports include the Test262 Git
+revision when the checkout is a Git worktree, selection, scenario counts,
+skips, and failures. Run the same revision and selection to compare results.
+The current runner is a baseline tool, not a certification harness; its
+unsupported host hooks and negative-phase limitation mean its skip and pass
+counts must be interpreted accordingly.
+
+Implementations should be driven by those failures and the ES2026
+specification. Until a complete, edition-appropriate conformance run is
+available, this is an experimental headless runtime, not a complete or
+certified ES2026 engine.
 
 The runtime has no per-script time, memory, or recursion limits. Do not use it
 as a security boundary for untrusted scripts.
@@ -78,4 +103,6 @@ as a security boundary for untrusted scripts.
 cargo fmt --all -- --check
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
+npm ci
+npm run test262 -- --test262 path\to\test262
 ```
