@@ -132,6 +132,10 @@ enum NativeFunction {
     ArrayMethod(&'static str),
     ArrayIteratorMethod(&'static str),
     IteratorNext,
+    MapConstructor,
+    MapMethod(&'static str),
+    SetConstructor,
+    SetMethod(&'static str),
     String,
     StringMethod(&'static str),
     Number,
@@ -165,6 +169,8 @@ struct Object {
     is_array: bool,
     extensible: bool,
     array_iterator: Option<ArrayIterator>,
+    map_data: Option<Vec<(Value, Value)>>,
+    set_data: Option<Vec<Value>>,
 }
 
 #[derive(Clone)]
@@ -223,6 +229,8 @@ pub struct Engine {
     global_object: ObjectId,
     array_prototype: ObjectId,
     array_iterator_prototype: ObjectId,
+    map_prototype: ObjectId,
+    set_prototype: ObjectId,
     string_prototype: ObjectId,
     number_prototype: ObjectId,
     boolean_prototype: ObjectId,
@@ -244,6 +252,8 @@ impl Engine {
             global_object: 0,
             array_prototype: 0,
             array_iterator_prototype: 0,
+            map_prototype: 0,
+            set_prototype: 0,
             string_prototype: 0,
             number_prototype: 0,
             boolean_prototype: 0,
@@ -259,6 +269,8 @@ impl Engine {
         engine.global_object = engine.alloc_object(Some(engine.object_prototype));
         engine.array_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.array_iterator_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.map_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.set_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.string_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.number_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.boolean_prototype = engine.alloc_object(Some(engine.object_prototype));
@@ -352,6 +364,7 @@ impl Engine {
         engine.install_array_builtins();
         engine.install_primitive_builtins();
         engine.install_math_builtins();
+        engine.install_collection_builtins();
         Self::declare_global(&mut engine, "undefined", Value::Undefined, false);
         Self::declare_global(&mut engine, "NaN", Value::Number(f64::NAN), false);
         Self::declare_global(&mut engine, "Infinity", Value::Number(f64::INFINITY), false);
@@ -489,6 +502,59 @@ impl Engine {
             self.set_property(reflect, name, Value::Object(function));
         }
         self.declare_global("Reflect", Value::Object(reflect), false);
+    }
+
+    fn install_collection_builtins(&mut self) {
+        let map = self.alloc_native(NativeFunction::MapConstructor, Some(self.object_prototype));
+        self.install_collection_prototype(
+            map,
+            "Map",
+            self.map_prototype,
+            &[
+                ("set", 2.0),
+                ("get", 1.0),
+                ("has", 1.0),
+                ("delete", 1.0),
+                ("clear", 0.0),
+            ],
+            true,
+        );
+        self.declare_global("Map", Value::Object(map), false);
+
+        let set = self.alloc_native(NativeFunction::SetConstructor, Some(self.object_prototype));
+        self.install_collection_prototype(
+            set,
+            "Set",
+            self.set_prototype,
+            &[("add", 1.0), ("has", 1.0), ("delete", 1.0), ("clear", 0.0)],
+            false,
+        );
+        self.declare_global("Set", Value::Object(set), false);
+    }
+
+    fn install_collection_prototype(
+        &mut self,
+        constructor: ObjectId,
+        name: &str,
+        prototype: ObjectId,
+        methods: &[(&'static str, f64)],
+        is_map: bool,
+    ) {
+        self.set_property(constructor, "name", Value::String(name.to_owned()));
+        self.set_property(constructor, "length", Value::Number(0.0));
+        self.set_property(constructor, "prototype", Value::Object(prototype));
+        self.set_builtin_property(prototype, "constructor", Value::Object(constructor));
+        for (method, length) in methods {
+            let native = if is_map {
+                NativeFunction::MapMethod(method)
+            } else {
+                NativeFunction::SetMethod(method)
+            };
+            let function = self.alloc_native(native, Some(self.object_prototype));
+            self.set_property(function, "name", Value::String((*method).to_owned()));
+            self.set_property(function, "length", Value::Number(*length));
+            self.set_builtin_property(prototype, method, Value::Object(function));
+        }
     }
 
     fn install_array_builtins(&mut self) {
@@ -1662,13 +1728,7 @@ impl Engine {
                         1,
                     ));
                 };
-                let constructible = matches!(
-                    self.objects[function_id].function,
-                    Some(Function::User { .. })
-                        | Some(Function::Native(
-                            NativeFunction::Object | NativeFunction::Error(_)
-                        ))
-                );
+                let constructible = self.is_constructor(function_id);
                 if !constructible {
                     return Err(EngineError::new(
                         "TypeError",
@@ -2391,6 +2451,8 @@ impl Engine {
                         | NativeFunction::String
                         | NativeFunction::Number
                         | NativeFunction::Boolean
+                        | NativeFunction::MapConstructor
+                        | NativeFunction::SetConstructor
                 ))
         )
     }
@@ -2454,6 +2516,18 @@ impl Engine {
                 return Ok(value);
             }
             current = self.objects[id].prototype;
+        }
+        if let Value::Object(id) = receiver {
+            if let Some(entries) = &self.objects[id].map_data
+                && name == "size"
+            {
+                return Ok(Value::Number(entries.len() as f64));
+            }
+            if let Some(values) = &self.objects[id].set_data
+                && name == "size"
+            {
+                return Ok(Value::Number(values.len() as f64));
+            }
         }
         Ok(Value::Undefined)
     }
@@ -2780,6 +2854,86 @@ impl Engine {
                     self.set_property(result, "done", Value::Boolean(false));
                 }
                 Ok(Value::Object(result))
+            }
+            NativeFunction::MapConstructor => {
+                let Value::Object(map) = this_value else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Map constructor must be called with new",
+                        1,
+                        1,
+                    ));
+                };
+                self.objects[map].map_data = Some(Vec::new());
+                if let Some(Value::Object(iterable)) = arguments.first()
+                    && self.objects[*iterable].is_array
+                {
+                    for index in 0..self.array_length(*iterable) {
+                        let entry = self
+                            .get_property(*iterable, &index.to_string())
+                            .unwrap_or(Value::Undefined);
+                        let Value::Object(pair) = entry else {
+                            return Err(EngineError::new(
+                                "TypeError",
+                                "Map entries must be objects",
+                                1,
+                                1,
+                            ));
+                        };
+                        let key = self.get_property(pair, "0").unwrap_or(Value::Undefined);
+                        let value = self.get_property(pair, "1").unwrap_or(Value::Undefined);
+                        self.map_set(map, key, value);
+                    }
+                } else if arguments
+                    .first()
+                    .is_some_and(|value| !matches!(value, Value::Undefined | Value::Null))
+                {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Map constructor argument is not iterable",
+                        1,
+                        1,
+                    ));
+                }
+                Ok(Value::Object(map))
+            }
+            NativeFunction::MapMethod(method) => {
+                self.call_map_method(method, this_value, arguments)
+            }
+            NativeFunction::SetConstructor => {
+                let Value::Object(set) = this_value else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Set constructor must be called with new",
+                        1,
+                        1,
+                    ));
+                };
+                self.objects[set].set_data = Some(Vec::new());
+                if let Some(Value::Object(iterable)) = arguments.first()
+                    && self.objects[*iterable].is_array
+                {
+                    for index in 0..self.array_length(*iterable) {
+                        let value = self
+                            .get_property(*iterable, &index.to_string())
+                            .unwrap_or(Value::Undefined);
+                        self.set_add(set, value);
+                    }
+                } else if arguments
+                    .first()
+                    .is_some_and(|value| !matches!(value, Value::Undefined | Value::Null))
+                {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Set constructor argument is not iterable",
+                        1,
+                        1,
+                    ));
+                }
+                Ok(Value::Object(set))
+            }
+            NativeFunction::SetMethod(method) => {
+                self.call_set_method(method, this_value, arguments)
             }
             NativeFunction::String => Ok(Value::String(
                 arguments
@@ -3249,6 +3403,150 @@ impl Engine {
                 }
             }
             _ => unreachable!("known Reflect method"),
+        }
+    }
+
+    fn map_set(&mut self, map: ObjectId, key: Value, value: Value) {
+        let entries = self.objects[map]
+            .map_data
+            .as_mut()
+            .expect("Map internal data is initialized");
+        if let Some((_, stored_value)) = entries
+            .iter_mut()
+            .find(|(stored_key, _)| same_value_zero(stored_key, &key))
+        {
+            *stored_value = value;
+        } else {
+            entries.push((key, value));
+        }
+    }
+
+    fn set_add(&mut self, set: ObjectId, value: Value) {
+        let values = self.objects[set]
+            .set_data
+            .as_mut()
+            .expect("Set internal data is initialized");
+        if !values
+            .iter()
+            .any(|stored_value| same_value_zero(stored_value, &value))
+        {
+            values.push(value);
+        }
+    }
+
+    fn call_map_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        let Value::Object(map) = this_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Map method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        if self.objects[map].map_data.is_none() {
+            return Err(EngineError::new(
+                "TypeError",
+                "Map method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        }
+        let key = arguments.first().cloned().unwrap_or(Value::Undefined);
+        let entries = self.objects[map]
+            .map_data
+            .as_mut()
+            .expect("Map internal data is initialized");
+        match method {
+            "set" => {
+                self.map_set(
+                    map,
+                    key,
+                    arguments.get(1).cloned().unwrap_or(Value::Undefined),
+                );
+                Ok(Value::Object(map))
+            }
+            "get" => Ok(entries
+                .iter()
+                .find(|(stored_key, _)| same_value_zero(stored_key, &key))
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Undefined)),
+            "has" => Ok(Value::Boolean(
+                entries
+                    .iter()
+                    .any(|(stored_key, _)| same_value_zero(stored_key, &key)),
+            )),
+            "delete" => {
+                let old_length = entries.len();
+                entries.retain(|(stored_key, _)| !same_value_zero(stored_key, &key));
+                Ok(Value::Boolean(entries.len() != old_length))
+            }
+            "clear" => {
+                entries.clear();
+                Ok(Value::Undefined)
+            }
+            _ => unreachable!("known Map method"),
+        }
+    }
+
+    fn call_set_method(
+        &mut self,
+        method: &str,
+        this_value: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        let Value::Object(set) = this_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Set method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        if self.objects[set].set_data.is_none() {
+            return Err(EngineError::new(
+                "TypeError",
+                "Set method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        }
+        let value = arguments.first().cloned().unwrap_or(Value::Undefined);
+        match method {
+            "add" => {
+                self.set_add(set, value);
+                Ok(Value::Object(set))
+            }
+            "has" => Ok(Value::Boolean(
+                self.objects[set]
+                    .set_data
+                    .as_ref()
+                    .expect("Set internal data is initialized")
+                    .iter()
+                    .any(|stored_value| same_value_zero(stored_value, &value)),
+            )),
+            "delete" => {
+                let values = self.objects[set]
+                    .set_data
+                    .as_mut()
+                    .expect("Set internal data is initialized");
+                let old_length = values.len();
+                values.retain(|stored_value| !same_value_zero(stored_value, &value));
+                Ok(Value::Boolean(values.len() != old_length))
+            }
+            "clear" => {
+                self.objects[set]
+                    .set_data
+                    .as_mut()
+                    .expect("Set internal data is initialized")
+                    .clear();
+                Ok(Value::Undefined)
+            }
+            _ => unreachable!("known Set method"),
         }
     }
 
@@ -5762,6 +6060,44 @@ mod tests {
                 .unwrap(),
             "3,4"
         );
+    }
+
+    #[test]
+    fn maps_and_sets_preserve_insertion_order_and_same_value_zero_keys() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let map = new Map([['first', 1], ['second', 2], ['first', 3]]); map.set(NaN, 4); map.set(NaN, 5); map.get('first') + ':' + map.get(NaN) + ':' + map.size + ':' + map.has('second')",
+                )
+                .unwrap(),
+            "3:5:3:true"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let identityMap = new Map(); let key = {}; identityMap.set(key, 7); identityMap.has({}) + ':' + identityMap.get(key) + ':' + identityMap.delete(key) + ':' + identityMap.size",
+                )
+                .unwrap(),
+            "false:7:true:0"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let collectionSet = new Set([1, 1, NaN]); collectionSet.add(NaN).add(2); collectionSet.size + ':' + collectionSet.has(NaN) + ':' + collectionSet.delete(1) + ':' + collectionSet.size",
+                )
+                .unwrap(),
+            "3:true:true:2"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("let clearedSet = new Set(); clearedSet.add(1); clearedSet.clear(); clearedSet.size")
+                .unwrap(),
+            "0"
+        );
+        assert_eq!(engine.eval("new Map([1])").unwrap_err().name, "TypeError");
+        assert_eq!(engine.eval("new Map({})").unwrap_err().name, "TypeError");
+        assert_eq!(engine.eval("new Set({})").unwrap_err().name, "TypeError");
     }
 
     #[test]
