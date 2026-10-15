@@ -39,8 +39,8 @@ The interpreter currently supports:
   searches, callback methods, and explicit `keys()`, `values()`, and `entries()`
   iterators
 - basic insertion-ordered `Map` and `Set` storage, core lookup and mutation
-  methods, `keys()`, `values()`, and `entries()` iterators, and iteration in
-  `for...of` and `Array.from`
+  methods, `forEach`, mutation-aware `keys()`, `values()`, and `entries()`
+  iterators, and iteration in `for...of` and `Array.from`
 - selected `String`, `Number`, and `Boolean` conversions and prototype methods,
   `Math`, global numeric conversion helpers, and `JSON.parse`/`JSON.stringify`
   with reviver, replacer, and indentation arguments
@@ -58,8 +58,9 @@ remain incomplete. The `Reflect` subset does not include symbols or every
 specification operation. Array and collection iterators are available through
 their methods, but the `Symbol.iterator` protocol and generic iterable
 consumption are not implemented; `for...of` and `Array.from` recognize only
-the runtime's supported built-in input types. Collection mutation during
-iteration and the full collection API are not complete. Some array methods,
+the runtime's supported built-in input types. Collection iteration handles
+basic additions and deletions, but the full collection API is not complete.
+Some array methods,
 complete string/number behavior, `Date`, `RegExp`, `Symbol`, `BigInt`, `Proxy`,
 `Reflect`, modules, promises/jobs, and many other specified APIs are not implemented.
 Classes, many constructor edge cases, complete `this` binding rules, and

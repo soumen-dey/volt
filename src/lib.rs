@@ -172,8 +172,8 @@ struct Object {
     extensible: bool,
     array_iterator: Option<ArrayIterator>,
     collection_iterator: Option<CollectionIterator>,
-    map_data: Option<Vec<(Value, Value)>>,
-    set_data: Option<Vec<Value>>,
+    map_data: Option<Vec<Option<(Value, Value)>>>,
+    set_data: Option<Vec<Option<Value>>>,
 }
 
 #[derive(Clone)]
@@ -189,6 +189,7 @@ struct CollectionIterator {
     index: usize,
     kind: &'static str,
     is_map: bool,
+    done: bool,
 }
 
 #[derive(Clone)]
@@ -540,6 +541,7 @@ impl Engine {
                 ("has", 1.0),
                 ("delete", 1.0),
                 ("clear", 0.0),
+                ("forEach", 1.0),
                 ("keys", 0.0),
                 ("values", 0.0),
                 ("entries", 0.0),
@@ -558,6 +560,7 @@ impl Engine {
                 ("has", 1.0),
                 ("delete", 1.0),
                 ("clear", 0.0),
+                ("forEach", 1.0),
                 ("keys", 0.0),
                 ("values", 0.0),
                 ("entries", 0.0),
@@ -920,6 +923,7 @@ impl Engine {
             index: 0,
             kind,
             is_map,
+            done: false,
         });
         iterator
     }
@@ -1854,7 +1858,7 @@ impl Engine {
                         .expect("Map internal data is initialized")
                         .clone();
                     let mut values = Vec::with_capacity(entries.len());
-                    for (key, value) in entries {
+                    for (key, value) in entries.into_iter().flatten() {
                         let pair = self.alloc_array();
                         self.set_property(pair, "0", key);
                         self.set_property(pair, "1", value);
@@ -1866,7 +1870,10 @@ impl Engine {
                     .set_data
                     .as_ref()
                     .expect("Set internal data is initialized")
-                    .clone()),
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .collect()),
                 Value::String(value) => Ok(value
                     .chars()
                     .map(|character| Value::String(character.to_string()))
@@ -2593,12 +2600,16 @@ impl Engine {
             if let Some(entries) = &self.objects[id].map_data
                 && name == "size"
             {
-                return Ok(Value::Number(entries.len() as f64));
+                return Ok(Value::Number(
+                    entries.iter().filter(|entry| entry.is_some()).count() as f64,
+                ));
             }
             if let Some(values) = &self.objects[id].set_data
                 && name == "size"
             {
-                return Ok(Value::Number(values.len() as f64));
+                return Ok(Value::Number(
+                    values.iter().filter(|value| value.is_some()).count() as f64,
+                ));
             }
         }
         Ok(Value::Undefined)
@@ -2928,46 +2939,8 @@ impl Engine {
                         1,
                     ));
                 };
-                let item = if state.is_map {
-                    self.objects[state.collection]
-                        .map_data
-                        .as_ref()
-                        .and_then(|entries| entries.get(state.index))
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .map(|(key, value)| match state.kind {
-                            "keys" => key,
-                            "values" => value,
-                            "entries" => {
-                                let pair = self.alloc_array();
-                                self.set_property(pair, "0", key);
-                                self.set_property(pair, "1", value);
-                                Value::Object(pair)
-                            }
-                            _ => unreachable!("known collection iterator kind"),
-                        })
-                } else {
-                    self.objects[state.collection]
-                        .set_data
-                        .as_ref()
-                        .and_then(|values| values.get(state.index))
-                        .cloned()
-                        .map(|value| match state.kind {
-                            "keys" | "values" => value,
-                            "entries" => {
-                                let pair = self.alloc_array();
-                                self.set_property(pair, "0", value.clone());
-                                self.set_property(pair, "1", value);
-                                Value::Object(pair)
-                            }
-                            _ => unreachable!("known collection iterator kind"),
-                        })
-                };
+                let item = self.next_collection_iterator_value(iterator, &state);
                 if let Some(value) = item {
-                    self.objects[iterator]
-                        .collection_iterator
-                        .as_mut()
-                        .expect("collection iterator state exists")
-                        .index += 1;
                     self.set_property(result, "value", value);
                     self.set_property(result, "done", Value::Boolean(false));
                 } else {
@@ -2989,7 +2962,8 @@ impl Engine {
                 if let Some(Value::Object(iterable)) = arguments.first()
                     && let Some(entries) = self.objects[*iterable].map_data.clone()
                 {
-                    self.objects[map].map_data = Some(entries);
+                    self.objects[map].map_data =
+                        Some(entries.into_iter().flatten().map(Some).collect());
                 } else if let Some(Value::Object(iterable)) = arguments.first()
                     && self.objects[*iterable].is_array
                 {
@@ -3041,11 +3015,12 @@ impl Engine {
                 if let Some(Value::Object(iterable)) = arguments.first()
                     && let Some(values) = self.objects[*iterable].set_data.clone()
                 {
-                    self.objects[set].set_data = Some(values);
+                    self.objects[set].set_data =
+                        Some(values.into_iter().flatten().map(Some).collect());
                 } else if let Some(Value::Object(iterable)) = arguments.first()
                     && let Some(entries) = self.objects[*iterable].map_data.clone()
                 {
-                    for (key, value) in entries {
+                    for (key, value) in entries.into_iter().flatten() {
                         let pair = self.alloc_array();
                         self.set_property(pair, "0", key);
                         self.set_property(pair, "1", value);
@@ -3557,11 +3532,12 @@ impl Engine {
             .expect("Map internal data is initialized");
         if let Some((_, stored_value)) = entries
             .iter_mut()
+            .filter_map(Option::as_mut)
             .find(|(stored_key, _)| same_value_zero(stored_key, &key))
         {
             *stored_value = value;
         } else {
-            entries.push((key, value));
+            entries.push(Some((key, value)));
         }
     }
 
@@ -3572,9 +3548,10 @@ impl Engine {
             .expect("Set internal data is initialized");
         if !values
             .iter()
+            .flatten()
             .any(|stored_value| same_value_zero(stored_value, &value))
         {
-            values.push(value);
+            values.push(Some(value));
         }
     }
 
@@ -3610,6 +3587,133 @@ impl Engine {
         ))
     }
 
+    fn next_collection_iterator_value(
+        &mut self,
+        iterator: ObjectId,
+        state: &CollectionIterator,
+    ) -> Option<Value> {
+        if state.done {
+            return None;
+        }
+        loop {
+            let index = self.objects[iterator]
+                .collection_iterator
+                .as_ref()
+                .expect("collection iterator state exists")
+                .index;
+            let entry = if state.is_map {
+                self.objects[state.collection]
+                    .map_data
+                    .as_ref()
+                    .and_then(|entries| entries.get(index))
+                    .and_then(Option::as_ref)
+                    .map(|(key, value)| (key.clone(), value.clone()))
+            } else {
+                self.objects[state.collection]
+                    .set_data
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .map(|value| (value.clone(), value))
+            };
+            let length = if state.is_map {
+                self.objects[state.collection]
+                    .map_data
+                    .as_ref()
+                    .expect("Map internal data is initialized")
+                    .len()
+            } else {
+                self.objects[state.collection]
+                    .set_data
+                    .as_ref()
+                    .expect("Set internal data is initialized")
+                    .len()
+            };
+            let iterator_state = self.objects[iterator]
+                .collection_iterator
+                .as_mut()
+                .expect("collection iterator state exists");
+            if index >= length {
+                iterator_state.done = true;
+                return None;
+            }
+            iterator_state.index += 1;
+            let Some((key, value)) = entry else {
+                continue;
+            };
+            return Some(match state.kind {
+                "keys" if state.is_map => key,
+                "values" => value,
+                "keys" => value.clone(),
+                "entries" => {
+                    let pair = self.alloc_array();
+                    self.set_property(pair, "0", key);
+                    self.set_property(pair, "1", value);
+                    Value::Object(pair)
+                }
+                _ => unreachable!("known collection iterator kind"),
+            });
+        }
+    }
+
+    fn call_collection_for_each(
+        &mut self,
+        collection: ObjectId,
+        is_map: bool,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EngineError> {
+        let Some(callback @ Value::Object(callback_id)) = arguments.first().cloned() else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Collection forEach callback must be callable",
+                1,
+                1,
+            ));
+        };
+        if self.objects[callback_id].function.is_none() {
+            return Err(EngineError::new(
+                "TypeError",
+                "Collection forEach callback must be callable",
+                1,
+                1,
+            ));
+        }
+        let this_arg = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+        let mut index = 0;
+        loop {
+            let item = if is_map {
+                let entries = self.objects[collection]
+                    .map_data
+                    .as_ref()
+                    .expect("Map internal data is initialized");
+                if index >= entries.len() {
+                    break;
+                }
+                entries[index].clone()
+            } else {
+                let values = self.objects[collection]
+                    .set_data
+                    .as_ref()
+                    .expect("Set internal data is initialized");
+                if index >= values.len() {
+                    break;
+                }
+                values[index].clone().map(|value| (value.clone(), value))
+            };
+            index += 1;
+            if let Some((key, value)) = item {
+                let callback_args = if is_map {
+                    vec![value, key, Value::Object(collection)]
+                } else {
+                    vec![value.clone(), value, Value::Object(collection)]
+                };
+                self.call(callback.clone(), this_arg.clone(), callback_args)?;
+            }
+        }
+        Ok(Value::Undefined)
+    }
+
     fn call_map_method(
         &mut self,
         method: &str,
@@ -3632,11 +3736,10 @@ impl Engine {
                 1,
             ));
         }
+        if method == "forEach" {
+            return self.call_collection_for_each(map, true, arguments);
+        }
         let key = arguments.first().cloned().unwrap_or(Value::Undefined);
-        let entries = self.objects[map]
-            .map_data
-            .as_mut()
-            .expect("Map internal data is initialized");
         match method {
             "set" => {
                 self.map_set(
@@ -3644,26 +3747,49 @@ impl Engine {
                     key,
                     arguments.get(1).cloned().unwrap_or(Value::Undefined),
                 );
-                Ok(Value::Object(map))
+                return Ok(Value::Object(map));
             }
+            "clear" => {
+                self.objects[map]
+                    .map_data
+                    .as_mut()
+                    .expect("Map internal data is initialized")
+                    .fill(None);
+                return Ok(Value::Undefined);
+            }
+            _ => {}
+        }
+        let entries = self.objects[map]
+            .map_data
+            .as_ref()
+            .expect("Map internal data is initialized");
+        match method {
             "get" => Ok(entries
                 .iter()
+                .flatten()
                 .find(|(stored_key, _)| same_value_zero(stored_key, &key))
                 .map(|(_, value)| value.clone())
                 .unwrap_or(Value::Undefined)),
             "has" => Ok(Value::Boolean(
                 entries
                     .iter()
+                    .flatten()
                     .any(|(stored_key, _)| same_value_zero(stored_key, &key)),
             )),
             "delete" => {
-                let old_length = entries.len();
-                entries.retain(|(stored_key, _)| !same_value_zero(stored_key, &key));
-                Ok(Value::Boolean(entries.len() != old_length))
-            }
-            "clear" => {
-                entries.clear();
-                Ok(Value::Undefined)
+                let entry = self.objects[map]
+                    .map_data
+                    .as_mut()
+                    .expect("Map internal data is initialized")
+                    .iter_mut()
+                    .find(|entry| {
+                        entry
+                            .as_ref()
+                            .is_some_and(|(stored_key, _)| same_value_zero(stored_key, &key))
+                    });
+                Ok(Value::Boolean(
+                    entry.is_some_and(|entry| entry.take().is_some()),
+                ))
             }
             _ => unreachable!("known Map method"),
         }
@@ -3691,11 +3817,22 @@ impl Engine {
                 1,
             ));
         }
+        if method == "forEach" {
+            return self.call_collection_for_each(set, false, arguments);
+        }
         let value = arguments.first().cloned().unwrap_or(Value::Undefined);
         match method {
             "add" => {
                 self.set_add(set, value);
                 Ok(Value::Object(set))
+            }
+            "clear" => {
+                self.objects[set]
+                    .set_data
+                    .as_mut()
+                    .expect("Set internal data is initialized")
+                    .fill(None);
+                Ok(Value::Undefined)
             }
             "has" => Ok(Value::Boolean(
                 self.objects[set]
@@ -3703,6 +3840,7 @@ impl Engine {
                     .as_ref()
                     .expect("Set internal data is initialized")
                     .iter()
+                    .flatten()
                     .any(|stored_value| same_value_zero(stored_value, &value)),
             )),
             "delete" => {
@@ -3710,17 +3848,13 @@ impl Engine {
                     .set_data
                     .as_mut()
                     .expect("Set internal data is initialized");
-                let old_length = values.len();
-                values.retain(|stored_value| !same_value_zero(stored_value, &value));
-                Ok(Value::Boolean(values.len() != old_length))
-            }
-            "clear" => {
-                self.objects[set]
-                    .set_data
-                    .as_mut()
-                    .expect("Set internal data is initialized")
-                    .clear();
-                Ok(Value::Undefined)
+                let item = values.iter_mut().find(|item| {
+                    item.as_ref()
+                        .is_some_and(|stored_value| same_value_zero(stored_value, &value))
+                });
+                Ok(Value::Boolean(
+                    item.is_some_and(|item| item.take().is_some()),
+                ))
             }
             _ => unreachable!("known Set method"),
         }
@@ -3787,7 +3921,10 @@ impl Engine {
                         .map_data
                         .as_ref()
                         .expect("Map internal data is initialized")
-                        .clone();
+                        .iter()
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>();
                     entries
                         .into_iter()
                         .map(|(key, value)| {
@@ -3803,8 +3940,9 @@ impl Engine {
                     .set_data
                     .as_ref()
                     .expect("Set internal data is initialized")
-                    .clone()
-                    .into_iter()
+                    .iter()
+                    .flatten()
+                    .cloned()
                     .map(Some)
                     .collect(),
                 Some(Value::String(value)) => value
@@ -6339,6 +6477,47 @@ mod tests {
                 )
                 .unwrap(),
             "2:2:2"
+        );
+    }
+
+    #[test]
+    fn collection_iteration_tracks_mutations_and_for_each_visits_new_entries() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let changingMap = new Map([['a', 1], ['b', 2], ['c', 3]]); let changingIterator = changingMap.keys(); let firstChangingKey = changingIterator.next().value; changingMap.delete('b'); changingMap.set('d', 4); firstChangingKey + ':' + changingIterator.next().value + ':' + changingIterator.next().value + ':' + changingIterator.next().done",
+                )
+                .unwrap(),
+            "a:c:d:true"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let visitedMap = new Map([['start', 1]]); let visitedKeys = ''; visitedMap.forEach(function(value, key, map) { visitedKeys += key; if (key === 'start') map.set('added', 2); }); visitedKeys + ':' + visitedMap.size",
+                )
+                .unwrap(),
+            "startadded:2"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let visitedSet = new Set([1]); let visitedValues = ''; visitedSet.forEach(function(value, key, set) { visitedValues += value; if (value === 1) { set.delete(1); set.add(2); } }); visitedValues",
+                )
+                .unwrap(),
+            "12"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let clearDuringIteration = new Set([1]); let clearIterator = clearDuringIteration.values(); clearDuringIteration.clear(); clearDuringIteration.add(2); clearIterator.next().value",
+                )
+                .unwrap(),
+            "2"
+        );
+        assert_eq!(
+            engine.eval("new Map().forEach(1)").unwrap_err().name,
+            "TypeError"
         );
     }
 
