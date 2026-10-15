@@ -134,8 +134,10 @@ enum NativeFunction {
     IteratorNext,
     MapConstructor,
     MapMethod(&'static str),
+    MapIteratorMethod(&'static str),
     SetConstructor,
     SetMethod(&'static str),
+    SetIteratorMethod(&'static str),
     String,
     StringMethod(&'static str),
     Number,
@@ -169,6 +171,7 @@ struct Object {
     is_array: bool,
     extensible: bool,
     array_iterator: Option<ArrayIterator>,
+    collection_iterator: Option<CollectionIterator>,
     map_data: Option<Vec<(Value, Value)>>,
     set_data: Option<Vec<Value>>,
 }
@@ -178,6 +181,14 @@ struct ArrayIterator {
     array: ObjectId,
     index: usize,
     kind: &'static str,
+}
+
+#[derive(Clone)]
+struct CollectionIterator {
+    collection: ObjectId,
+    index: usize,
+    kind: &'static str,
+    is_map: bool,
 }
 
 #[derive(Clone)]
@@ -229,6 +240,7 @@ pub struct Engine {
     global_object: ObjectId,
     array_prototype: ObjectId,
     array_iterator_prototype: ObjectId,
+    collection_iterator_prototype: ObjectId,
     map_prototype: ObjectId,
     set_prototype: ObjectId,
     string_prototype: ObjectId,
@@ -252,6 +264,7 @@ impl Engine {
             global_object: 0,
             array_prototype: 0,
             array_iterator_prototype: 0,
+            collection_iterator_prototype: 0,
             map_prototype: 0,
             set_prototype: 0,
             string_prototype: 0,
@@ -269,6 +282,7 @@ impl Engine {
         engine.global_object = engine.alloc_object(Some(engine.object_prototype));
         engine.array_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.array_iterator_prototype = engine.alloc_object(Some(engine.object_prototype));
+        engine.collection_iterator_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.map_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.set_prototype = engine.alloc_object(Some(engine.object_prototype));
         engine.string_prototype = engine.alloc_object(Some(engine.object_prototype));
@@ -505,6 +519,16 @@ impl Engine {
     }
 
     fn install_collection_builtins(&mut self) {
+        let iterator_next =
+            self.alloc_native(NativeFunction::IteratorNext, Some(self.object_prototype));
+        self.set_property(iterator_next, "name", Value::String("next".to_owned()));
+        self.set_property(iterator_next, "length", Value::Number(0.0));
+        self.set_builtin_property(
+            self.collection_iterator_prototype,
+            "next",
+            Value::Object(iterator_next),
+        );
+
         let map = self.alloc_native(NativeFunction::MapConstructor, Some(self.object_prototype));
         self.install_collection_prototype(
             map,
@@ -516,6 +540,9 @@ impl Engine {
                 ("has", 1.0),
                 ("delete", 1.0),
                 ("clear", 0.0),
+                ("keys", 0.0),
+                ("values", 0.0),
+                ("entries", 0.0),
             ],
             true,
         );
@@ -526,7 +553,15 @@ impl Engine {
             set,
             "Set",
             self.set_prototype,
-            &[("add", 1.0), ("has", 1.0), ("delete", 1.0), ("clear", 0.0)],
+            &[
+                ("add", 1.0),
+                ("has", 1.0),
+                ("delete", 1.0),
+                ("clear", 0.0),
+                ("keys", 0.0),
+                ("values", 0.0),
+                ("entries", 0.0),
+            ],
             false,
         );
         self.declare_global("Set", Value::Object(set), false);
@@ -545,10 +580,11 @@ impl Engine {
         self.set_property(constructor, "prototype", Value::Object(prototype));
         self.set_builtin_property(prototype, "constructor", Value::Object(constructor));
         for (method, length) in methods {
-            let native = if is_map {
-                NativeFunction::MapMethod(method)
-            } else {
-                NativeFunction::SetMethod(method)
+            let native = match (is_map, *method) {
+                (true, "keys" | "values" | "entries") => NativeFunction::MapIteratorMethod(method),
+                (false, "keys" | "values" | "entries") => NativeFunction::SetIteratorMethod(method),
+                (true, _) => NativeFunction::MapMethod(method),
+                (false, _) => NativeFunction::SetMethod(method),
             };
             let function = self.alloc_native(native, Some(self.object_prototype));
             self.set_property(function, "name", Value::String((*method).to_owned()));
@@ -868,6 +904,22 @@ impl Engine {
             array,
             index: 0,
             kind,
+        });
+        iterator
+    }
+
+    fn alloc_collection_iterator(
+        &mut self,
+        collection: ObjectId,
+        kind: &'static str,
+        is_map: bool,
+    ) -> ObjectId {
+        let iterator = self.alloc_object(Some(self.collection_iterator_prototype));
+        self.objects[iterator].collection_iterator = Some(CollectionIterator {
+            collection,
+            index: 0,
+            kind,
+            is_map,
         });
         iterator
     }
@@ -1786,7 +1838,7 @@ impl Engine {
         }
     }
 
-    fn for_each_values(&self, iterable: Value, is_of: bool) -> Result<Vec<Value>, EngineError> {
+    fn for_each_values(&mut self, iterable: Value, is_of: bool) -> Result<Vec<Value>, EngineError> {
         if is_of {
             return match iterable {
                 Value::Object(id) if self.objects[id].is_array => Ok((0..self.array_length(id))
@@ -1795,6 +1847,26 @@ impl Engine {
                             .unwrap_or(Value::Undefined)
                     })
                     .collect()),
+                Value::Object(id) if self.objects[id].map_data.is_some() => {
+                    let entries = self.objects[id]
+                        .map_data
+                        .as_ref()
+                        .expect("Map internal data is initialized")
+                        .clone();
+                    let mut values = Vec::with_capacity(entries.len());
+                    for (key, value) in entries {
+                        let pair = self.alloc_array();
+                        self.set_property(pair, "0", key);
+                        self.set_property(pair, "1", value);
+                        values.push(Value::Object(pair));
+                    }
+                    Ok(values)
+                }
+                Value::Object(id) if self.objects[id].set_data.is_some() => Ok(self.objects[id]
+                    .set_data
+                    .as_ref()
+                    .expect("Set internal data is initialized")
+                    .clone()),
                 Value::String(value) => Ok(value
                     .chars()
                     .map(|character| Value::String(character.to_string()))
@@ -2808,24 +2880,18 @@ impl Engine {
                 let Value::Object(iterator) = this_value else {
                     return Err(EngineError::new(
                         "TypeError",
-                        "Array Iterator next called on an incompatible receiver",
-                        1,
-                        1,
-                    ));
-                };
-                let Some(state) = self.objects[iterator].array_iterator.clone() else {
-                    return Err(EngineError::new(
-                        "TypeError",
-                        "Array Iterator next called on an incompatible receiver",
+                        "Iterator next called on an incompatible receiver",
                         1,
                         1,
                     ));
                 };
                 let result = self.alloc_object(Some(self.object_prototype));
-                if state.index >= self.array_length(state.array) {
-                    self.set_property(result, "value", Value::Undefined);
-                    self.set_property(result, "done", Value::Boolean(true));
-                } else {
+                if let Some(state) = self.objects[iterator].array_iterator.clone() {
+                    if state.index >= self.array_length(state.array) {
+                        self.set_property(result, "value", Value::Undefined);
+                        self.set_property(result, "done", Value::Boolean(true));
+                        return Ok(Value::Object(result));
+                    }
                     let index = state.index;
                     let value = match state.kind {
                         "keys" => Value::Number(index as f64),
@@ -2852,6 +2918,61 @@ impl Engine {
                         .index += 1;
                     self.set_property(result, "value", value);
                     self.set_property(result, "done", Value::Boolean(false));
+                    return Ok(Value::Object(result));
+                }
+                let Some(state) = self.objects[iterator].collection_iterator.clone() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Iterator next called on an incompatible receiver",
+                        1,
+                        1,
+                    ));
+                };
+                let item = if state.is_map {
+                    self.objects[state.collection]
+                        .map_data
+                        .as_ref()
+                        .and_then(|entries| entries.get(state.index))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .map(|(key, value)| match state.kind {
+                            "keys" => key,
+                            "values" => value,
+                            "entries" => {
+                                let pair = self.alloc_array();
+                                self.set_property(pair, "0", key);
+                                self.set_property(pair, "1", value);
+                                Value::Object(pair)
+                            }
+                            _ => unreachable!("known collection iterator kind"),
+                        })
+                } else {
+                    self.objects[state.collection]
+                        .set_data
+                        .as_ref()
+                        .and_then(|values| values.get(state.index))
+                        .cloned()
+                        .map(|value| match state.kind {
+                            "keys" | "values" => value,
+                            "entries" => {
+                                let pair = self.alloc_array();
+                                self.set_property(pair, "0", value.clone());
+                                self.set_property(pair, "1", value);
+                                Value::Object(pair)
+                            }
+                            _ => unreachable!("known collection iterator kind"),
+                        })
+                };
+                if let Some(value) = item {
+                    self.objects[iterator]
+                        .collection_iterator
+                        .as_mut()
+                        .expect("collection iterator state exists")
+                        .index += 1;
+                    self.set_property(result, "value", value);
+                    self.set_property(result, "done", Value::Boolean(false));
+                } else {
+                    self.set_property(result, "value", Value::Undefined);
+                    self.set_property(result, "done", Value::Boolean(true));
                 }
                 Ok(Value::Object(result))
             }
@@ -2866,6 +2987,10 @@ impl Engine {
                 };
                 self.objects[map].map_data = Some(Vec::new());
                 if let Some(Value::Object(iterable)) = arguments.first()
+                    && let Some(entries) = self.objects[*iterable].map_data.clone()
+                {
+                    self.objects[map].map_data = Some(entries);
+                } else if let Some(Value::Object(iterable)) = arguments.first()
                     && self.objects[*iterable].is_array
                 {
                     for index in 0..self.array_length(*iterable) {
@@ -2900,6 +3025,9 @@ impl Engine {
             NativeFunction::MapMethod(method) => {
                 self.call_map_method(method, this_value, arguments)
             }
+            NativeFunction::MapIteratorMethod(kind) => {
+                self.call_collection_iterator_method(kind, this_value, true)
+            }
             NativeFunction::SetConstructor => {
                 let Value::Object(set) = this_value else {
                     return Err(EngineError::new(
@@ -2911,6 +3039,19 @@ impl Engine {
                 };
                 self.objects[set].set_data = Some(Vec::new());
                 if let Some(Value::Object(iterable)) = arguments.first()
+                    && let Some(values) = self.objects[*iterable].set_data.clone()
+                {
+                    self.objects[set].set_data = Some(values);
+                } else if let Some(Value::Object(iterable)) = arguments.first()
+                    && let Some(entries) = self.objects[*iterable].map_data.clone()
+                {
+                    for (key, value) in entries {
+                        let pair = self.alloc_array();
+                        self.set_property(pair, "0", key);
+                        self.set_property(pair, "1", value);
+                        self.set_add(set, Value::Object(pair));
+                    }
+                } else if let Some(Value::Object(iterable)) = arguments.first()
                     && self.objects[*iterable].is_array
                 {
                     for index in 0..self.array_length(*iterable) {
@@ -2934,6 +3075,9 @@ impl Engine {
             }
             NativeFunction::SetMethod(method) => {
                 self.call_set_method(method, this_value, arguments)
+            }
+            NativeFunction::SetIteratorMethod(kind) => {
+                self.call_collection_iterator_method(kind, this_value, false)
             }
             NativeFunction::String => Ok(Value::String(
                 arguments
@@ -3434,6 +3578,38 @@ impl Engine {
         }
     }
 
+    fn call_collection_iterator_method(
+        &mut self,
+        kind: &'static str,
+        this_value: Value,
+        is_map: bool,
+    ) -> Result<Value, EngineError> {
+        let Value::Object(collection) = this_value else {
+            return Err(EngineError::new(
+                "TypeError",
+                "Collection iterator method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        };
+        let initialized = if is_map {
+            self.objects[collection].map_data.is_some()
+        } else {
+            self.objects[collection].set_data.is_some()
+        };
+        if !initialized {
+            return Err(EngineError::new(
+                "TypeError",
+                "Collection iterator method called on an incompatible receiver",
+                1,
+                1,
+            ));
+        }
+        Ok(Value::Object(
+            self.alloc_collection_iterator(collection, kind, is_map),
+        ))
+    }
+
     fn call_map_method(
         &mut self,
         method: &str,
@@ -3603,6 +3779,31 @@ impl Engine {
             let mut values = match arguments.first() {
                 Some(Value::Object(id)) if self.objects[*id].is_array => self
                     .array_iterator_values(*id)?
+                    .into_iter()
+                    .map(Some)
+                    .collect(),
+                Some(Value::Object(id)) if self.objects[*id].map_data.is_some() => {
+                    let entries = self.objects[*id]
+                        .map_data
+                        .as_ref()
+                        .expect("Map internal data is initialized")
+                        .clone();
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| {
+                            let pair = self.alloc_array();
+                            self.set_property(pair, "0", key);
+                            self.set_property(pair, "1", value);
+                            Some(Value::Object(pair))
+                        })
+                        .collect()
+                }
+                Some(Value::Object(id)) if self.objects[*id].set_data.is_some() => self.objects
+                    [*id]
+                    .set_data
+                    .as_ref()
+                    .expect("Set internal data is initialized")
+                    .clone()
                     .into_iter()
                     .map(Some)
                     .collect(),
@@ -6098,6 +6299,47 @@ mod tests {
         assert_eq!(engine.eval("new Map([1])").unwrap_err().name, "TypeError");
         assert_eq!(engine.eval("new Map({})").unwrap_err().name, "TypeError");
         assert_eq!(engine.eval("new Set({})").unwrap_err().name, "TypeError");
+    }
+
+    #[test]
+    fn map_and_set_iterators_work_with_array_from_and_for_of() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let iterMap = new Map([['a', 1], ['b', 2]]); let iterSet = new Set([3, 4]); let mapEntryIterator = iterMap.entries(); let setEntryIterator = iterSet.entries(); let firstMapEntry = mapEntryIterator.next().value; let firstSetEntry = setEntryIterator.next().value; firstMapEntry[0] + ':' + firstMapEntry[1] + ':' + firstSetEntry[0] + ':' + firstSetEntry[1]",
+                )
+                .unwrap(),
+            "a:1:3:3"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("Array.from(iterMap).length + ':' + Array.from(iterSet).join(',')",)
+                .unwrap(),
+            "2:3,4"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let mapLoopResult = ''; for (let pair of iterMap) { mapLoopResult = mapLoopResult + pair[0] + pair[1]; } let setLoopResult = ''; for (let item of iterSet) { setLoopResult = setLoopResult + item; } mapLoopResult + ':' + setLoopResult",
+                )
+                .unwrap(),
+            "a1b2:34"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string("let exhaustedMapIterator = iterMap.values(); exhaustedMapIterator.next().done + ':' + exhaustedMapIterator.next().done + ':' + exhaustedMapIterator.next().done")
+                .unwrap(),
+            "false:false:true"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let copiedMap = new Map(iterMap); let copiedSet = new Set(iterSet); let setFromMap = new Set(iterMap); copiedMap.get('b') + ':' + copiedSet.size + ':' + setFromMap.size",
+                )
+                .unwrap(),
+            "2:2:2"
+        );
     }
 
     #[test]

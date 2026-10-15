@@ -38,6 +38,9 @@ The interpreter currently supports:
   `unshift`, `splice`, `slice`, `concat`, `join`, `reverse`, `flat`, `flatMap`,
   searches, callback methods, and explicit `keys()`, `values()`, and `entries()`
   iterators
+- basic insertion-ordered `Map` and `Set` storage, core lookup and mutation
+  methods, `keys()`, `values()`, and `entries()` iterators, and iteration in
+  `for...of` and `Array.from`
 - selected `String`, `Number`, and `Boolean` conversions and prototype methods,
   `Math`, global numeric conversion helpers, and `JSON.parse`/`JSON.stringify`
   with reviver, replacer, and indentation arguments
@@ -52,8 +55,11 @@ The built-ins are a focused subset, not the full ECMAScript standard library.
 Property descriptors include basic data and accessor behavior, but descriptor
 invariants and descriptor-aware behavior across every internal mutation path
 remain incomplete. The `Reflect` subset does not include symbols or every
-specification operation. Array iterators are available through their methods,
-but `Symbol.iterator` integration is not implemented. Some array methods,
+specification operation. Array and collection iterators are available through
+their methods, but the `Symbol.iterator` protocol and generic iterable
+consumption are not implemented; `for...of` and `Array.from` recognize only
+the runtime's supported built-in input types. Collection mutation during
+iteration and the full collection API are not complete. Some array methods,
 complete string/number behavior, `Date`, `RegExp`, `Symbol`, `BigInt`, `Proxy`,
 `Reflect`, modules, promises/jobs, and many other specified APIs are not implemented.
 Classes, many constructor edge cases, complete `this` binding rules, and
