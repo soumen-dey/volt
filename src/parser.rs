@@ -1,7 +1,5 @@
-use crate::{
-    EngineError, Value,
-    lexer::{Token, TokenKind},
-};
+use crate::lexer::{Token, TokenKind};
+use crate::{EngineError, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnaryOp {
@@ -33,6 +31,7 @@ pub(crate) enum BinaryOp {
     Nullish,
 }
 
+#[derive(Clone)]
 pub(crate) enum Expr {
     Literal(Value),
     Identifier {
@@ -40,8 +39,9 @@ pub(crate) enum Expr {
         line: usize,
         column: usize,
     },
+    This,
     Assignment {
-        name: String,
+        target: Box<Expr>,
         value: Box<Expr>,
         line: usize,
         column: usize,
@@ -57,8 +57,19 @@ pub(crate) enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    Function {
+        name: Option<String>,
+        parameters: Vec<String>,
+        body: Vec<Stmt>,
+    },
+    Object(Vec<(String, Expr)>),
+    Member(Box<Expr>, String),
+    Index(Box<Expr>, Box<Expr>),
+    Call(Box<Expr>, Vec<Expr>),
+    Construct(Box<Expr>, Vec<Expr>),
 }
 
+#[derive(Clone)]
 pub(crate) enum Stmt {
     Empty,
     Expression(Expr),
@@ -68,6 +79,11 @@ pub(crate) enum Stmt {
         mutable: bool,
         line: usize,
         column: usize,
+    },
+    FunctionDeclaration {
+        name: String,
+        parameters: Vec<String>,
+        body: Vec<Stmt>,
     },
     Block(Vec<Stmt>),
     If {
@@ -79,8 +95,17 @@ pub(crate) enum Stmt {
         condition: Expr,
         body: Box<Stmt>,
     },
+    Return(Option<Expr>),
+    Throw(Expr),
+    Try {
+        body: Box<Stmt>,
+        catch_name: Option<String>,
+        catch_body: Option<Box<Stmt>>,
+        finally_body: Option<Box<Stmt>>,
+    },
 }
 
+#[derive(Clone)]
 pub(crate) struct Program {
     pub statements: Vec<Stmt>,
 }
@@ -88,11 +113,16 @@ pub(crate) struct Program {
 pub(crate) struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    function_depth: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, current: 0 }
+        Self {
+            tokens,
+            current: 0,
+            function_depth: 0,
+        }
     }
 
     pub fn parse_program(mut self) -> Result<Program, EngineError> {
@@ -113,11 +143,47 @@ impl Parser {
         {
             return self.declaration();
         }
+        if self.matches_keyword("function") {
+            let (name, _, _) = self.consume_identifier("Expected a function name")?;
+            let (parameters, body) = self.function_tail()?;
+            return Ok(Stmt::FunctionDeclaration {
+                name,
+                parameters,
+                body,
+            });
+        }
         if self.matches_keyword("if") {
             return self.if_statement();
         }
         if self.matches_keyword("while") {
             return self.while_statement();
+        }
+        if self.matches_keyword("return") {
+            if self.function_depth == 0 {
+                return Err(self.error_here("'return' is only valid inside a function"));
+            }
+            let value = if self.check(&TokenKind::Semicolon)
+                || self.check(&TokenKind::RightBrace)
+                || self.is_at_end()
+                || self.peek().line > self.previous().line
+            {
+                None
+            } else {
+                Some(self.expression()?)
+            };
+            self.consume_statement_end()?;
+            return Ok(Stmt::Return(value));
+        }
+        if self.matches_keyword("throw") {
+            if self.peek().line > self.previous().line {
+                return Err(self.error_here("A line break is not allowed after 'throw'"));
+            }
+            let value = self.expression()?;
+            self.consume_statement_end()?;
+            return Ok(Stmt::Throw(value));
+        }
+        if self.matches_keyword("try") {
+            return self.try_statement();
         }
         if self.matches(&TokenKind::LeftBrace) {
             return self.block();
@@ -129,10 +195,7 @@ impl Parser {
 
     fn declaration(&mut self) -> Result<Stmt, EngineError> {
         let keyword = self.previous().clone();
-        let mutable = !matches!(
-            &keyword.kind,
-            TokenKind::Identifier(name) if name == "const"
-        );
+        let mutable = !matches!(&keyword.kind, TokenKind::Identifier(name) if name == "const");
         let (name, line, column) = self.consume_identifier("Expected a binding name")?;
         let initializer = if self.matches_operator("=") {
             Some(self.assignment()?)
@@ -177,6 +240,36 @@ impl Parser {
         Ok(Stmt::While { condition, body })
     }
 
+    fn try_statement(&mut self) -> Result<Stmt, EngineError> {
+        let body = Box::new(self.statement()?);
+        let (catch_name, catch_body) = if self.matches_keyword("catch") {
+            let binding = if self.matches(&TokenKind::LeftParen) {
+                let (name, _, _) = self.consume_identifier("Expected catch binding")?;
+                self.consume(&TokenKind::RightParen, "Expected ')' after catch binding")?;
+                Some(name)
+            } else {
+                None
+            };
+            (binding, Some(Box::new(self.statement()?)))
+        } else {
+            (None, None)
+        };
+        let finally_body = if self.matches_keyword("finally") {
+            Some(Box::new(self.statement()?))
+        } else {
+            None
+        };
+        if catch_body.is_none() && finally_body.is_none() {
+            return Err(self.error_here("Expected 'catch' or 'finally' after try block"));
+        }
+        Ok(Stmt::Try {
+            body,
+            catch_name,
+            catch_body,
+            finally_body,
+        })
+    }
+
     fn block(&mut self) -> Result<Stmt, EngineError> {
         let mut statements = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
@@ -184,6 +277,28 @@ impl Parser {
         }
         self.consume(&TokenKind::RightBrace, "Expected '}' after block")?;
         Ok(Stmt::Block(statements))
+    }
+
+    fn function_tail(&mut self) -> Result<(Vec<String>, Vec<Stmt>), EngineError> {
+        self.consume(&TokenKind::LeftParen, "Expected '(' after function name")?;
+        let mut parameters = Vec::new();
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                parameters.push(self.consume_identifier("Expected parameter name")?.0);
+                if !self.matches(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(&TokenKind::RightParen, "Expected ')' after parameters")?;
+        self.consume(&TokenKind::LeftBrace, "Expected '{' before function body")?;
+        self.function_depth += 1;
+        let body = self.block();
+        self.function_depth -= 1;
+        match body? {
+            Stmt::Block(statements) => Ok((parameters, statements)),
+            _ => unreachable!(),
+        }
     }
 
     fn expression(&mut self) -> Result<Expr, EngineError> {
@@ -195,9 +310,12 @@ impl Parser {
         if self.matches_operator("=") {
             let equals = self.previous().clone();
             let value = self.assignment()?;
-            if let Expr::Identifier { name, .. } = expression {
+            if matches!(
+                expression,
+                Expr::Identifier { .. } | Expr::Member(_, _) | Expr::Index(_, _)
+            ) {
                 return Ok(Expr::Assignment {
-                    name,
+                    target: Box::new(expression),
                     value: Box::new(value),
                     line: equals.line,
                     column: equals.column,
@@ -260,10 +378,83 @@ impl Parser {
                 column: token.column,
             });
         }
-        self.primary()
+        self.postfix()
+    }
+
+    fn postfix(&mut self) -> Result<Expr, EngineError> {
+        let mut expression = self.primary()?;
+        loop {
+            if self.matches(&TokenKind::Dot) {
+                let (name, _, _) = self.consume_identifier("Expected a property name after '.'")?;
+                expression = Expr::Member(Box::new(expression), name);
+            } else if self.matches(&TokenKind::LeftBracket) {
+                let property = self.expression()?;
+                self.consume(
+                    &TokenKind::RightBracket,
+                    "Expected ']' after property expression",
+                )?;
+                expression = Expr::Index(Box::new(expression), Box::new(property));
+            } else if self.matches(&TokenKind::LeftParen) {
+                let mut arguments = Vec::new();
+                if !self.check(&TokenKind::RightParen) {
+                    loop {
+                        arguments.push(self.assignment()?);
+                        if !self.matches(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.consume(&TokenKind::RightParen, "Expected ')' after arguments")?;
+                expression = Expr::Call(Box::new(expression), arguments);
+            } else {
+                break;
+            }
+        }
+        Ok(expression)
     }
 
     fn primary(&mut self) -> Result<Expr, EngineError> {
+        if self.matches_keyword("new") {
+            let (name, line, column) =
+                self.consume_identifier("Expected a constructor after 'new'")?;
+            let mut callee = Expr::Identifier { name, line, column };
+            while self.matches(&TokenKind::Dot) {
+                let (property, _, _) =
+                    self.consume_identifier("Expected a property name after '.'")?;
+                callee = Expr::Member(Box::new(callee), property);
+            }
+            self.consume(&TokenKind::LeftParen, "Expected '(' after constructor")?;
+            let mut arguments = Vec::new();
+            if !self.check(&TokenKind::RightParen) {
+                loop {
+                    arguments.push(self.assignment()?);
+                    if !self.matches(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.consume(
+                &TokenKind::RightParen,
+                "Expected ')' after constructor arguments",
+            )?;
+            return Ok(Expr::Construct(Box::new(callee), arguments));
+        }
+        if self.matches_keyword("function") {
+            let name = if matches!(self.peek().kind, TokenKind::Identifier(_)) {
+                Some(self.consume_identifier("Expected function name")?.0)
+            } else {
+                None
+            };
+            let (parameters, body) = self.function_tail()?;
+            return Ok(Expr::Function {
+                name,
+                parameters,
+                body,
+            });
+        }
+        if self.matches(&TokenKind::LeftBrace) {
+            return self.object_literal();
+        }
         let token = self.advance().clone();
         match token.kind {
             TokenKind::Number(value) => Ok(Expr::Literal(Value::Number(value))),
@@ -278,6 +469,7 @@ impl Parser {
             TokenKind::Identifier(name) if name == "undefined" => {
                 Ok(Expr::Literal(Value::Undefined))
             }
+            TokenKind::Identifier(name) if name == "this" => Ok(Expr::This),
             TokenKind::Identifier(name) => Ok(Expr::Identifier {
                 name,
                 line: token.line,
@@ -290,6 +482,30 @@ impl Parser {
             }
             _ => Err(self.error_at(&token, "Expected an expression")),
         }
+    }
+
+    fn object_literal(&mut self) -> Result<Expr, EngineError> {
+        let mut properties = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            let key = match self.advance().clone() {
+                Token {
+                    kind: TokenKind::Identifier(key) | TokenKind::String(key),
+                    ..
+                } => key,
+                Token {
+                    kind: TokenKind::Number(number),
+                    ..
+                } => number.to_string(),
+                token => return Err(self.error_at(&token, "Expected an object property name")),
+            };
+            self.consume(&TokenKind::Colon, "Expected ':' after object property name")?;
+            properties.push((key, self.assignment()?));
+            if !self.matches(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.consume(&TokenKind::RightBrace, "Expected '}' after object literal")?;
+        Ok(Expr::Object(properties))
     }
 
     fn current_binary_operator(&self) -> Option<(BinaryOp, u8)> {

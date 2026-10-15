@@ -11,23 +11,29 @@ part of the runtime target.
 
 ## Current implementation
 
-The initial interpreter supports:
+The interpreter currently supports:
 
 - `undefined`, `null`, booleans, decimal numbers, and single-/double-quoted strings
 - `let`, `const`, and `var` declarations (currently block-scoped)
 - arithmetic, comparison, equality, logical, and nullish-coalescing operators
-- assignment to declared identifiers
+- assignment to declared identifiers and object properties
 - unary `!`, `+`, `-`, `typeof`, and `void`
-- blocks, `if`/`else`, and `while`
+- blocks, `if`/`else`, `while`, and `try`/`catch`/`finally`
+- function declarations and expressions, parameters, return, closures, and method `this`
+- object literals, property reads/writes, constructor calls, prototype lookup,
+  and `Object.create`, `Object.getPrototypeOf`, and `Object.setPrototypeOf`
 - line and block comments
 - a persistent global environment across evaluations
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
-Functions, objects, arrays, classes, exceptions, modules, promises, the
-ECMAScript standard library, garbage collection, and most other language
-features are not implemented. Unsupported syntax reports a `SyntaxError`.
-This implementation must not be used to execute untrusted or unbounded scripts;
-it does not yet enforce time, memory, or recursion limits.
+Arrays, classes, many constructor edge cases, `this` binding rules beyond
+direct method calls, complete ECMAScript error objects, modules, promises/jobs,
+and most standard built-ins are not implemented. Unsupported syntax reports a
+`SyntaxError`. Object and scope storage is engine-owned and reclaimed
+when the engine is dropped; there is no garbage collector yet, so long-running
+engines retain allocations made by evaluated scripts. This implementation must
+not be used to execute untrusted or unbounded scripts; it does not yet enforce
+time, memory, or recursion limits.
 
 ## Run
 
@@ -62,13 +68,14 @@ formats that value for the CLI and simple embedding use. The `Value` type and
 
 The intended sequence is to grow the own implementation incrementally:
 
-1. Expand lexer/parser coverage and diagnostics.
-2. Implement ECMAScript execution semantics, functions, closures, objects,
-   prototypes, and exceptions.
-3. Add standard built-ins, promise jobs, and modules.
-4. Establish a useful Test262 harness and measure progress against a pinned
-   suite revision; only then expand toward ES2020.
-5. Design object-heap memory management and safe embedding/resource controls.
+1. Continue covering and correcting ECMAScript function, object, prototype,
+   constructor, and exception semantics.
+2. Add arrays and the standard built-ins systematically.
+3. Implement promise jobs and modules.
+4. Replace engine-lifetime arena retention with a tracing garbage collector;
+   add safe embedding/resource controls.
+5. Make the Test262 harness work with the owned runtime and measure progress
+   against a pinned suite revision; only then expand toward ES2020.
 
 The repository's Test262 runner is an initial scaffold, not currently a valid
 conformance harness for this implementation. It depends on features (including
