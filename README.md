@@ -28,8 +28,9 @@ The interpreter currently supports:
   function names/length, `arguments`, and strict/sloppy direct-call `this`
 - object literals, property reads/writes, constructor calls, prototype lookup,
   `in`, `instanceof`, and `Object.create`, `Object.getPrototypeOf`, and
-  `Object.setPrototypeOf`, plus basic `Object.keys`, `getOwnPropertyNames`,
-  `values`, `entries`, `assign`, `fromEntries`, `hasOwn`, and `is`
+  `Object.setPrototypeOf`, basic data-property descriptors and integrity
+  operations, plus `Object.keys`, `getOwnPropertyNames`, `values`, `entries`,
+  `assign`, `fromEntries`, `hasOwn`, and `is`
 - sparse array literals and basic `Array` construction, indexed properties,
   mutable `length`, and common array methods (`push`, `pop`, `shift`,
   `unshift`, `splice`, `slice`, `concat`, `join`, `reverse`, `flat`, `flatMap`,
@@ -44,9 +45,11 @@ The interpreter currently supports:
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
 The built-ins are a focused subset, not the full ECMAScript standard library.
-Array iteration protocols and some methods, complete string/number behavior,
-property descriptors, `Date`, `RegExp`, `Symbol`, `BigInt`, `Proxy`, `Reflect`,
-modules, promises/jobs, and many other specified APIs are not implemented.
+Property descriptors include basic data and accessor behavior, but descriptor
+invariants and descriptor-aware behavior across every internal mutation path
+remain incomplete. Array iteration protocols and some methods,
+complete string/number behavior, `Date`, `RegExp`, `Symbol`, `BigInt`, `Proxy`,
+`Reflect`, modules, promises/jobs, and many other specified APIs are not implemented.
 Classes, many constructor edge cases, complete `this` binding rules, and
 complete ECMAScript error objects are also missing. The parser and runtime
 semantics remain a limited subset; passing the focused Rust tests does not

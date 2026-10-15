@@ -121,6 +121,9 @@ enum NativeFunction {
     ObjectCreate,
     ObjectGetPrototypeOf,
     ObjectSetPrototypeOf,
+    ObjectDefineProperty,
+    ObjectGetOwnPropertyDescriptor,
+    ObjectIntegrity(&'static str),
     ObjectMethod(&'static str),
     Error(&'static str),
     Array,
@@ -152,10 +155,28 @@ struct Object {
     properties: HashMap<String, Value>,
     property_order: Vec<String>,
     non_enumerable: HashSet<String>,
+    property_attributes: HashMap<String, PropertyAttributes>,
     parameter_map: HashMap<String, (ScopeId, String)>,
     prototype: Option<ObjectId>,
     function: Option<Function>,
     is_array: bool,
+    extensible: bool,
+}
+
+#[derive(Clone)]
+struct PropertyAttributes {
+    writable: bool,
+    configurable: bool,
+    kind: PropertyKind,
+}
+
+#[derive(Clone)]
+enum PropertyKind {
+    Data,
+    Accessor {
+        getter: Option<Value>,
+        setter: Option<Value>,
+    },
 }
 
 enum Completion {
@@ -239,6 +260,14 @@ impl Engine {
             NativeFunction::ObjectSetPrototypeOf,
             Some(engine.object_prototype),
         );
+        let define_property = engine.alloc_native(
+            NativeFunction::ObjectDefineProperty,
+            Some(engine.object_prototype),
+        );
+        let get_own_property_descriptor = engine.alloc_native(
+            NativeFunction::ObjectGetOwnPropertyDescriptor,
+            Some(engine.object_prototype),
+        );
         engine.set_property(
             object_constructor,
             "prototype",
@@ -255,6 +284,39 @@ impl Engine {
             "setPrototypeOf",
             Value::Object(set_prototype),
         );
+        engine.set_property(
+            object_constructor,
+            "defineProperty",
+            Value::Object(define_property),
+        );
+        engine.set_property(
+            object_constructor,
+            "getOwnPropertyDescriptor",
+            Value::Object(get_own_property_descriptor),
+        );
+        for (function, name, length) in [
+            (define_property, "defineProperty", 3.0),
+            (get_own_property_descriptor, "getOwnPropertyDescriptor", 2.0),
+        ] {
+            engine.set_property(function, "name", Value::String(name.to_owned()));
+            engine.set_property(function, "length", Value::Number(length));
+        }
+        for method in [
+            "preventExtensions",
+            "seal",
+            "freeze",
+            "isExtensible",
+            "isSealed",
+            "isFrozen",
+        ] {
+            let function = engine.alloc_native(
+                NativeFunction::ObjectIntegrity(method),
+                Some(engine.object_prototype),
+            );
+            engine.set_property(function, "name", Value::String(method.to_owned()));
+            engine.set_property(function, "length", Value::Number(1.0));
+            engine.set_property(object_constructor, method, Value::Object(function));
+        }
         engine.set_property(
             object_constructor,
             "name",
@@ -344,6 +406,12 @@ impl Engine {
             ("assign", "assign", 2.0),
             ("fromEntries", "fromEntries", 1.0),
             ("hasOwn", "hasOwn", 2.0),
+            ("defineProperties", "defineProperties", 2.0),
+            (
+                "getOwnPropertyDescriptors",
+                "getOwnPropertyDescriptors",
+                1.0,
+            ),
         ] {
             let function = self.alloc_native(
                 NativeFunction::ObjectMethod(native),
@@ -360,7 +428,11 @@ impl Engine {
         self.set_property(method, "name", Value::String("toString".to_owned()));
         self.set_property(method, "length", Value::Number(0.0));
         self.set_builtin_property(self.object_prototype, "toString", Value::Object(method));
-        for (name, arity) in [("hasOwnProperty", 1.0), ("propertyIsEnumerable", 1.0)] {
+        for (name, arity) in [
+            ("hasOwnProperty", 1.0),
+            ("propertyIsEnumerable", 1.0),
+            ("isPrototypeOf", 1.0),
+        ] {
             let method = self.alloc_native(
                 NativeFunction::ObjectMethod(name),
                 Some(self.object_prototype),
@@ -644,6 +716,7 @@ impl Engine {
         let id = self.objects.len();
         self.objects.push(Object {
             prototype,
+            extensible: true,
             ..Object::default()
         });
         id
@@ -658,6 +731,14 @@ impl Engine {
         self.objects[array]
             .non_enumerable
             .insert("length".to_owned());
+        self.objects[array].property_attributes.insert(
+            "length".to_owned(),
+            PropertyAttributes {
+                writable: true,
+                configurable: false,
+                kind: PropertyKind::Data,
+            },
+        );
         array
     }
 
@@ -1630,7 +1711,7 @@ impl Engine {
         }
     }
 
-    fn read_reference(&self, reference: &Reference) -> Result<Value, EngineError> {
+    fn read_reference(&mut self, reference: &Reference) -> Result<Value, EngineError> {
         match reference {
             Reference::Binding {
                 scope,
@@ -1823,6 +1904,13 @@ impl Engine {
                 let object = self.evaluate(object, scope)?;
                 match object {
                     Value::Object(id) => {
+                        if self.objects[id]
+                            .property_attributes
+                            .get(property)
+                            .is_some_and(|attributes| !attributes.configurable)
+                        {
+                            return Ok(Value::Boolean(false));
+                        }
                         self.objects[id].parameter_map.remove(property);
                         if self.objects[id].is_array && property == "length" {
                             Ok(Value::Boolean(false))
@@ -1845,6 +1933,13 @@ impl Engine {
                 let property = self.evaluate(property, scope)?.to_js_string();
                 match object {
                     Value::Object(id) => {
+                        if self.objects[id]
+                            .property_attributes
+                            .get(&property)
+                            .is_some_and(|attributes| !attributes.configurable)
+                        {
+                            return Ok(Value::Boolean(false));
+                        }
                         self.objects[id].parameter_map.remove(&property);
                         if self.objects[id].is_array && property == "length" {
                             Ok(Value::Boolean(false))
@@ -1916,6 +2011,14 @@ impl Engine {
         self.objects[object]
             .properties
             .insert(name.to_owned(), value);
+        self.objects[object]
+            .property_attributes
+            .entry(name.to_owned())
+            .or_insert(PropertyAttributes {
+                writable: true,
+                configurable: true,
+                kind: PropertyKind::Data,
+            });
         if self.objects[object].is_array
             && let Some(index) = array_index(name)
         {
@@ -1939,9 +2042,235 @@ impl Engine {
 
     fn remove_property(&mut self, object: ObjectId, name: &str) {
         self.objects[object].properties.remove(name);
+        self.objects[object].property_attributes.remove(name);
+        self.objects[object].non_enumerable.remove(name);
         self.objects[object]
             .property_order
             .retain(|property| property != name);
+    }
+
+    fn define_data_property(
+        &mut self,
+        object: ObjectId,
+        name: &str,
+        descriptor: ObjectId,
+    ) -> Result<(), EngineError> {
+        let has_get = self.objects[descriptor].properties.contains_key("get");
+        let has_set = self.objects[descriptor].properties.contains_key("set");
+        let has_value = self.objects[descriptor].properties.contains_key("value");
+        let has_writable = self.objects[descriptor].properties.contains_key("writable");
+        if (has_get || has_set) && (has_value || has_writable) {
+            return Err(EngineError::new(
+                "TypeError",
+                "Invalid mixed property descriptor",
+                1,
+                1,
+            ));
+        }
+        let exists = self.objects[object].properties.contains_key(name);
+        if !exists && !self.objects[object].extensible {
+            return Err(EngineError::new(
+                "TypeError",
+                "Cannot define a property on a non-extensible object",
+                1,
+                1,
+            ));
+        }
+        let old_attributes = self.objects[object]
+            .property_attributes
+            .get(name)
+            .cloned()
+            .unwrap_or(PropertyAttributes {
+                writable: true,
+                configurable: true,
+                kind: PropertyKind::Data,
+            });
+        let accessor_descriptor = has_get || has_set;
+        let configurable = self
+            .get_own_property(descriptor, "configurable")
+            .map(|value| value.is_truthy())
+            .unwrap_or(if exists {
+                old_attributes.configurable
+            } else {
+                false
+            });
+        let writable = self
+            .get_own_property(descriptor, "writable")
+            .map(|value| value.is_truthy())
+            .unwrap_or_else(|| match old_attributes.kind {
+                PropertyKind::Data if exists && !accessor_descriptor => old_attributes.writable,
+                _ => false,
+            });
+        let enumerable = self
+            .get_own_property(descriptor, "enumerable")
+            .map(|value| value.is_truthy())
+            .unwrap_or(if exists {
+                !self.objects[object].non_enumerable.contains(name)
+            } else {
+                false
+            });
+        let old_enumerable = !self.objects[object].non_enumerable.contains(name);
+        let new_kind = if accessor_descriptor {
+            let (old_getter, old_setter) = match &old_attributes.kind {
+                PropertyKind::Accessor { getter, setter } => (getter.clone(), setter.clone()),
+                PropertyKind::Data => (None, None),
+            };
+            let getter = if has_get {
+                self.get_own_property(descriptor, "get")
+                    .unwrap_or(Value::Undefined)
+            } else {
+                old_getter.unwrap_or(Value::Undefined)
+            };
+            let setter = if has_set {
+                self.get_own_property(descriptor, "set")
+                    .unwrap_or(Value::Undefined)
+            } else {
+                old_setter.unwrap_or(Value::Undefined)
+            };
+            for accessor in [&getter, &setter] {
+                if !matches!(accessor, Value::Undefined)
+                    && !matches!(accessor, Value::Object(id) if self.objects[*id].function.is_some())
+                {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Getter and setter must be callable or undefined",
+                        1,
+                        1,
+                    ));
+                }
+            }
+            PropertyKind::Accessor {
+                getter: (!matches!(getter, Value::Undefined)).then_some(getter),
+                setter: (!matches!(setter, Value::Undefined)).then_some(setter),
+            }
+        } else if has_value || has_writable || !exists {
+            PropertyKind::Data
+        } else {
+            old_attributes.kind.clone()
+        };
+
+        if exists && !old_attributes.configurable {
+            if configurable
+                || old_enumerable != enumerable
+                || std::mem::discriminant(&old_attributes.kind) != std::mem::discriminant(&new_kind)
+            {
+                return Err(EngineError::new(
+                    "TypeError",
+                    "Cannot redefine a non-configurable property",
+                    1,
+                    1,
+                ));
+            }
+            match (&old_attributes.kind, &new_kind) {
+                (PropertyKind::Data, PropertyKind::Data) => {
+                    if !old_attributes.writable
+                        && (writable
+                            || self.get_own_property(descriptor, "value").is_some_and(
+                                |new_value| {
+                                    self.get_own_property(object, name)
+                                        .is_some_and(|old_value| {
+                                            !same_value(&old_value, &new_value)
+                                        })
+                                },
+                            ))
+                    {
+                        return Err(EngineError::new(
+                            "TypeError",
+                            "Cannot change a non-writable property",
+                            1,
+                            1,
+                        ));
+                    }
+                }
+                (
+                    PropertyKind::Accessor {
+                        getter: old_getter,
+                        setter: old_setter,
+                    },
+                    PropertyKind::Accessor {
+                        getter: new_getter,
+                        setter: new_setter,
+                    },
+                ) if old_getter != new_getter || old_setter != new_setter => {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Cannot change a non-configurable accessor",
+                        1,
+                        1,
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        match &new_kind {
+            PropertyKind::Data => {
+                if let Some(value) = self.get_own_property(descriptor, "value") {
+                    self.set_property(object, name, value);
+                } else if !exists || matches!(old_attributes.kind, PropertyKind::Accessor { .. }) {
+                    self.set_property(object, name, Value::Undefined);
+                }
+            }
+            PropertyKind::Accessor { .. } => {
+                if !exists || matches!(old_attributes.kind, PropertyKind::Data) {
+                    self.set_property(object, name, Value::Undefined);
+                }
+            }
+        }
+        if enumerable {
+            self.objects[object].non_enumerable.remove(name);
+        } else {
+            self.objects[object].non_enumerable.insert(name.to_owned());
+        }
+        self.objects[object].property_attributes.insert(
+            name.to_owned(),
+            PropertyAttributes {
+                writable: matches!(new_kind, PropertyKind::Data) && writable,
+                configurable,
+                kind: new_kind,
+            },
+        );
+        Ok(())
+    }
+
+    fn property_descriptor(&mut self, object: ObjectId, name: &str) -> Option<ObjectId> {
+        self.get_own_property(object, name)?;
+        let attributes = self.objects[object]
+            .property_attributes
+            .get(name)
+            .cloned()
+            .unwrap_or(PropertyAttributes {
+                writable: true,
+                configurable: true,
+                kind: PropertyKind::Data,
+            });
+        let descriptor = self.alloc_object(Some(self.object_prototype));
+        match attributes.kind {
+            PropertyKind::Data => {
+                self.set_property(
+                    descriptor,
+                    "value",
+                    self.get_own_property(object, name)
+                        .unwrap_or(Value::Undefined),
+                );
+                self.set_property(descriptor, "writable", Value::Boolean(attributes.writable));
+            }
+            PropertyKind::Accessor { getter, setter } => {
+                self.set_property(descriptor, "get", getter.unwrap_or(Value::Undefined));
+                self.set_property(descriptor, "set", setter.unwrap_or(Value::Undefined));
+            }
+        }
+        self.set_property(
+            descriptor,
+            "enumerable",
+            Value::Boolean(!self.objects[object].non_enumerable.contains(name)),
+        );
+        self.set_property(
+            descriptor,
+            "configurable",
+            Value::Boolean(attributes.configurable),
+        );
+        Some(descriptor)
     }
 
     fn get_own_property(&self, object: ObjectId, name: &str) -> Option<Value> {
@@ -2003,14 +2332,14 @@ impl Engine {
     }
 
     fn get_property_value(
-        &self,
+        &mut self,
         value: Value,
         name: &str,
         line: usize,
         column: usize,
     ) -> Result<Value, EngineError> {
         match value {
-            Value::Object(id) => Ok(self.get_property(id, name).unwrap_or(Value::Undefined)),
+            Value::Object(id) => self.get_property_with_receiver(id, Value::Object(id), name),
             Value::Null | Value::Undefined => Err(EngineError::new(
                 "TypeError",
                 format!("Cannot read properties of {}", value.to_js_string()),
@@ -2020,18 +2349,49 @@ impl Engine {
             Value::String(value) if name == "length" => {
                 Ok(Value::Number(value.encode_utf16().count() as f64))
             }
-            Value::String(value) => Ok(array_index(name)
-                .and_then(|index| value.chars().nth(index as usize))
-                .map(|character| Value::String(character.to_string()))
-                .or_else(|| self.get_property(self.string_prototype, name))
-                .unwrap_or(Value::Undefined)),
-            Value::Number(_) => Ok(self
-                .get_property(self.number_prototype, name)
-                .unwrap_or(Value::Undefined)),
-            Value::Boolean(_) => Ok(self
-                .get_property(self.boolean_prototype, name)
-                .unwrap_or(Value::Undefined)),
+            Value::String(value) => {
+                if let Some(index) = array_index(name)
+                    && let Some(character) = value.chars().nth(index as usize)
+                {
+                    return Ok(Value::String(character.to_string()));
+                }
+                self.get_property_with_receiver(self.string_prototype, Value::String(value), name)
+            }
+            Value::Number(value) => {
+                self.get_property_with_receiver(self.number_prototype, Value::Number(value), name)
+            }
+            Value::Boolean(value) => {
+                self.get_property_with_receiver(self.boolean_prototype, Value::Boolean(value), name)
+            }
         }
+    }
+
+    fn get_property_with_receiver(
+        &mut self,
+        object: ObjectId,
+        receiver: Value,
+        name: &str,
+    ) -> Result<Value, EngineError> {
+        let mut current = Some(object);
+        let mut visited = HashSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                return Ok(Value::Undefined);
+            }
+            if let Some(attributes) = self.objects[id].property_attributes.get(name).cloned()
+                && let PropertyKind::Accessor { getter, .. } = attributes.kind
+            {
+                return match getter {
+                    Some(getter) => self.call(getter, receiver, Vec::new()),
+                    None => Ok(Value::Undefined),
+                };
+            }
+            if let Some(value) = self.get_own_property(id, name) {
+                return Ok(value);
+            }
+            current = self.objects[id].prototype;
+        }
+        Ok(Value::Undefined)
     }
 
     fn set_property_value(
@@ -2043,6 +2403,70 @@ impl Engine {
         column: usize,
     ) -> Result<(), EngineError> {
         if let Value::Object(id) = value {
+            let mut current = Some(id);
+            let mut visited = HashSet::new();
+            let mut found = None;
+            while let Some(prototype) = current {
+                if !visited.insert(prototype) {
+                    break;
+                }
+                if let Some(attributes) = self.objects[prototype]
+                    .property_attributes
+                    .get(name)
+                    .cloned()
+                {
+                    found = Some((prototype, attributes));
+                    break;
+                }
+                current = self.objects[prototype].prototype;
+            }
+            if let Some((
+                _,
+                PropertyAttributes {
+                    kind: PropertyKind::Accessor { setter, .. },
+                    ..
+                },
+            )) = &found
+            {
+                if let Some(setter) = setter.clone() {
+                    self.call(setter, Value::Object(id), vec![property])?;
+                    return Ok(());
+                }
+                if self.strict {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        format!("Property '{name}' has no setter"),
+                        line,
+                        column,
+                    ));
+                }
+                return Ok(());
+            }
+            if let Some((_owner, attributes)) = found
+                && !attributes.writable
+            {
+                if self.strict {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        format!("Cannot assign to read only property '{name}'"),
+                        line,
+                        column,
+                    ));
+                }
+                return Ok(());
+            }
+            let own_property = self.objects[id].properties.contains_key(name);
+            if !own_property && !self.objects[id].extensible {
+                if self.strict {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        format!("Cannot add property '{name}' to a non-extensible object"),
+                        line,
+                        column,
+                    ));
+                }
+                return Ok(());
+            }
             if self.objects[id].is_array && name == "length" {
                 let length = property.to_number();
                 if !length.is_finite()
@@ -2381,6 +2805,99 @@ impl Engine {
                 }
                 self.objects[*id].prototype = prototype;
                 Ok(Value::Object(*id))
+            }
+            NativeFunction::ObjectDefineProperty => {
+                let Some(Value::Object(object)) = arguments.first() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Object.defineProperty requires an object",
+                        1,
+                        1,
+                    ));
+                };
+                let key = arguments
+                    .get(1)
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_else(|| "undefined".to_owned());
+                let Some(Value::Object(descriptor)) = arguments.get(2) else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Property description must be an object",
+                        1,
+                        1,
+                    ));
+                };
+                self.define_data_property(*object, &key, *descriptor)?;
+                Ok(Value::Object(*object))
+            }
+            NativeFunction::ObjectGetOwnPropertyDescriptor => {
+                let Some(Value::Object(object)) = arguments.first() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Object.getOwnPropertyDescriptor requires an object",
+                        1,
+                        1,
+                    ));
+                };
+                let key = arguments
+                    .get(1)
+                    .map(|value| self.to_string(value))
+                    .unwrap_or_else(|| "undefined".to_owned());
+                Ok(self
+                    .property_descriptor(*object, &key)
+                    .map(Value::Object)
+                    .unwrap_or(Value::Undefined))
+            }
+            NativeFunction::ObjectIntegrity(method) => {
+                let object = match arguments.first() {
+                    Some(Value::Object(object)) => Some(*object),
+                    _ => None,
+                };
+                match method {
+                    "preventExtensions" => {
+                        if let Some(object) = object {
+                            self.objects[object].extensible = false;
+                        }
+                        Ok(arguments.first().cloned().unwrap_or(Value::Undefined))
+                    }
+                    "seal" | "freeze" => {
+                        if let Some(object) = object {
+                            let names = self.own_property_names(object);
+                            for name in names {
+                                let attributes = self.objects[object]
+                                    .property_attributes
+                                    .entry(name)
+                                    .or_insert(PropertyAttributes {
+                                        writable: true,
+                                        configurable: true,
+                                        kind: PropertyKind::Data,
+                                    });
+                                attributes.configurable = false;
+                                if method == "freeze" {
+                                    attributes.writable = false;
+                                }
+                            }
+                            self.objects[object].extensible = false;
+                        }
+                        Ok(arguments.first().cloned().unwrap_or(Value::Undefined))
+                    }
+                    "isExtensible" => Ok(Value::Boolean(
+                        object.is_some_and(|object| self.objects[object].extensible),
+                    )),
+                    "isSealed" | "isFrozen" => Ok(Value::Boolean(object.is_none_or(|object| {
+                        !self.objects[object].extensible
+                            && self.objects[object].properties.keys().all(|name| {
+                                self.objects[object]
+                                    .property_attributes
+                                    .get(name)
+                                    .is_some_and(|attributes| {
+                                        !attributes.configurable
+                                            && (method != "isFrozen" || !attributes.writable)
+                                    })
+                            })
+                    }))),
+                    _ => unreachable!("known object integrity method"),
+                }
             }
             NativeFunction::Error(name) => {
                 let prototype = self.error_prototypes.get(name).copied();
@@ -3260,6 +3777,26 @@ impl Engine {
                             || !self.objects[object].non_enumerable.contains(&name)),
                 ))
             }
+            "isPrototypeOf" => {
+                let Value::Object(prototype) = this_value else {
+                    return Ok(Value::Boolean(false));
+                };
+                let Some(Value::Object(object)) = arguments.first() else {
+                    return Ok(Value::Boolean(false));
+                };
+                let mut current = self.objects[*object].prototype;
+                let mut visited = HashSet::new();
+                while let Some(id) = current {
+                    if id == prototype {
+                        return Ok(Value::Boolean(true));
+                    }
+                    if !visited.insert(id) {
+                        break;
+                    }
+                    current = self.objects[id].prototype;
+                }
+                Ok(Value::Boolean(false))
+            }
             "toString" => match this_value {
                 Value::Null => Ok(Value::String("[object Null]".to_owned())),
                 Value::Undefined => Ok(Value::String("[object Undefined]".to_owned())),
@@ -3300,6 +3837,59 @@ impl Engine {
                     .map(|value| self.to_string(value))
                     .unwrap_or_else(|| "undefined".to_owned());
                 Ok(Value::Boolean(self.get_own_property(*id, &name).is_some()))
+            }
+            "defineProperties" => {
+                let Some(Value::Object(target)) = arguments.first() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Object.defineProperties requires an object",
+                        1,
+                        1,
+                    ));
+                };
+                let Some(Value::Object(descriptors)) = arguments.get(1) else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Property descriptions must be an object",
+                        1,
+                        1,
+                    ));
+                };
+                let entries: Vec<(String, ObjectId)> = self
+                    .enumerable_property_names(*descriptors)
+                    .into_iter()
+                    .filter_map(|key| match self.get_own_property(*descriptors, &key) {
+                        Some(Value::Object(descriptor)) => Some(Ok((key, descriptor))),
+                        Some(_) => Some(Err(EngineError::new(
+                            "TypeError",
+                            "Property description must be an object",
+                            1,
+                            1,
+                        ))),
+                        None => None,
+                    })
+                    .collect::<Result<_, _>>()?;
+                for (key, descriptor) in entries {
+                    self.define_data_property(*target, &key, descriptor)?;
+                }
+                Ok(Value::Object(*target))
+            }
+            "getOwnPropertyDescriptors" => {
+                let Some(Value::Object(object)) = arguments.first() else {
+                    return Err(EngineError::new(
+                        "TypeError",
+                        "Object.getOwnPropertyDescriptors requires an object",
+                        1,
+                        1,
+                    ));
+                };
+                let result = self.alloc_object(Some(self.object_prototype));
+                for name in self.own_property_names(*object) {
+                    if let Some(descriptor) = self.property_descriptor(*object, &name) {
+                        self.set_property(result, &name, Value::Object(descriptor));
+                    }
+                }
+                Ok(Value::Object(result))
             }
             "keys" | "getOwnPropertyNames" | "values" | "entries" => {
                 let Some(Value::Object(id)) = arguments.first() else {
@@ -3743,6 +4333,15 @@ fn same_value_zero(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
             left == right || (left.is_nan() && right.is_nan())
+        }
+        _ => left == right,
+    }
+}
+
+fn same_value(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            (left.is_nan() && right.is_nan()) || left.to_bits() == right.to_bits()
         }
         _ => left == right,
     }
@@ -4643,6 +5242,72 @@ mod tests {
         assert_eq!(
             engine.eval("JSON.parse('{invalid}')").unwrap_err().name,
             "SyntaxError"
+        );
+    }
+
+    #[test]
+    fn object_property_descriptors_and_integrity_operations_work() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let object = {}; Object.defineProperty(object, 'hidden', { value: 7, writable: false, enumerable: false, configurable: false }); Object.getOwnPropertyDescriptor(object, 'hidden').value + ':' + Object.keys(object).length",
+                )
+                .unwrap(),
+            "7:0"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let item = { value: 1 }; Object.freeze(item); item.value = 2; item.value + ':' + Object.isFrozen(item) + ':' + Object.isSealed(item)",
+                )
+                .unwrap(),
+            "1:true:true"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let fixedObject = {}; Object.defineProperty(fixedObject, 'fixed', { value: 1, configurable: false }); delete fixedObject.fixed",
+                )
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(
+            engine            .eval("let extensibleObject = {}; Object.preventExtensions(extensibleObject); extensibleObject.newValue = 1; Object.isExtensible(extensibleObject)").unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let calls = 0; let access = {}; Object.defineProperty(access, 'value', { get: function() { return this._value; }, set: function(value) { calls++; this._value = value; }, enumerable: true, configurable: true }); access.value = 9; access.value + ':' + calls + ':' + (typeof Object.getOwnPropertyDescriptor(access, 'value').set)",
+                )
+                .unwrap(),
+            "9:1:function"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let parent = {}; Object.defineProperty(parent, 'value', { set: function(value) { this.saved = value; }, configurable: true }); let child = Object.create(parent); child.value = 4; child.saved",
+                )
+                .unwrap(),
+            "4"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let fixedAccessor = {}; Object.defineProperty(fixedAccessor, 'value', { get: function() { return 3; }, configurable: false }); Object.defineProperty(fixedAccessor, 'value', { get: function() { return 4; } })",
+                )
+                .unwrap_err()
+                .name,
+            "TypeError"
+        );
+        assert_eq!(
+            engine
+                .eval_to_string(
+                    "let target = {}; Object.defineProperties(target, { first: { value: 2, enumerable: true }, second: { value: 3 } }); let descriptors = Object.getOwnPropertyDescriptors(target); target.first + target.second + ':' + Object.keys(descriptors).join(',') + ':' + Object.prototype.isPrototypeOf(target)",
+                )
+                .unwrap(),
+            "5:first,second:true"
         );
     }
 
