@@ -2,6 +2,7 @@ use crate::lexer::{Token, TokenKind};
 use crate::{EngineError, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
 pub(crate) enum UnaryOp {
     Not,
     Plus,
@@ -13,6 +14,7 @@ pub(crate) enum UnaryOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
 pub(crate) enum BinaryOp {
     Add,
     Subtract,

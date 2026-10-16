@@ -1,5 +1,6 @@
 mod lexer;
 mod parser;
+mod vm;
 
 use lexer::Lexer;
 use parser::{BinaryOp, DeclarationKind, Expr, Stmt, UnaryOp};
@@ -282,6 +283,7 @@ pub struct Engine {
     error_prototypes: HashMap<&'static str, ObjectId>,
     strict: bool,
     random_state: u64,
+    bytecode_cache: Vec<HashMap<usize, vm::Bytecode>>,
 }
 
 impl Engine {
@@ -309,6 +311,7 @@ impl Engine {
             boolean_prototype: 0,
             error_prototypes: HashMap::new(),
             strict: false,
+            bytecode_cache: Vec::new(),
             random_state: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_nanos() as u64)
@@ -1362,9 +1365,11 @@ impl Engine {
     pub fn eval(&mut self, source: &str) -> Result<Value, EngineError> {
         let tokens = Lexer::new(source).tokenize()?;
         let program = parser::Parser::new(tokens).parse_program()?;
+        self.bytecode_cache.push(HashMap::new());
         let previous_strict = self.strict;
         self.strict = program.strict;
         let execution = self.execute_statements(&program.statements, self.global);
+        self.bytecode_cache.pop();
         self.strict = previous_strict;
         match execution? {
             Completion::Normal(value) => Ok(value),
@@ -1778,6 +1783,20 @@ impl Engine {
     }
 
     fn evaluate(&mut self, expression: &Expr, scope: ScopeId) -> Result<Value, EngineError> {
+        let expression_key = expression as *const Expr as usize;
+        let bytecode = self.bytecode_cache.last_mut().and_then(|cache| {
+            cache
+                .remove(&expression_key)
+                .or_else(|| vm::Bytecode::compile(expression))
+        });
+        if let Some(mut bytecode) = bytecode {
+            let result = bytecode.run(self, scope);
+            if let Some(cache) = self.bytecode_cache.last_mut() {
+                cache.insert(expression_key, bytecode);
+            }
+            return result;
+        }
+
         match expression {
             Expr::Literal(value) => Ok(value.clone()),
             Expr::This => match self.get_binding(scope, "this", 1, 1)? {
@@ -3011,7 +3030,9 @@ impl Engine {
                 }
                 let previous_strict = self.strict;
                 self.strict = strict;
+                self.bytecode_cache.push(HashMap::new());
                 let result = self.execute_statements(&body, function_scope);
+                self.bytecode_cache.pop();
                 self.strict = previous_strict;
                 match result? {
                     Completion::Normal(_) => Ok(Value::Undefined),
@@ -7083,6 +7104,108 @@ fn to_uint32(value: f64) -> u32 {
         return 0;
     }
     value.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+impl vm::Host for Engine {
+    fn load_binding(
+        &mut self,
+        scope: usize,
+        name: &str,
+        line: usize,
+        column: usize,
+        cache: &mut vm::InlineCache,
+    ) -> Result<Value, EngineError> {
+        if let Some(binding_scope) = cache.binding_for(scope) {
+            if let Some(binding_scope) = binding_scope
+                && let Some(binding) = self.scopes[binding_scope].bindings.get(name)
+            {
+                if !binding.initialized {
+                    return Err(EngineError::new(
+                        "ReferenceError",
+                        format!("Cannot access '{name}' before initialization"),
+                        line,
+                        column,
+                    ));
+                }
+                return Ok(binding.value.clone());
+            }
+            if binding_scope.is_none() {
+                return self.get_binding(scope, name, line, column)?.ok_or_else(|| {
+                    EngineError::new(
+                        "ReferenceError",
+                        format!("{name} is not defined"),
+                        line,
+                        column,
+                    )
+                });
+            }
+        }
+
+        let binding_scope = self.find_binding_scope(scope, name);
+        cache.cache_binding(scope, binding_scope);
+        self.get_binding(scope, name, line, column)?.ok_or_else(|| {
+            EngineError::new(
+                "ReferenceError",
+                format!("{name} is not defined"),
+                line,
+                column,
+            )
+        })
+    }
+
+    fn unary(&mut self, operator: UnaryOp, value: Value) -> Result<Value, EngineError> {
+        match operator {
+            UnaryOp::Not => Ok(Value::Boolean(!value.is_truthy())),
+            UnaryOp::Plus => Ok(Value::Number(value.to_number())),
+            UnaryOp::Minus => Ok(Value::Number(-value.to_number())),
+            UnaryOp::BitNot => Ok(Value::Number((!to_uint32(value.to_number()) as i32) as f64)),
+            UnaryOp::TypeOf => Ok(Value::String(
+                match value {
+                    Value::Undefined => "undefined",
+                    Value::Null => "object",
+                    Value::Boolean(_) => "boolean",
+                    Value::Number(_) => "number",
+                    Value::String(_) => "string",
+                    Value::Object(id) if self.objects[id].function.is_some() => "function",
+                    Value::Object(_) => "object",
+                }
+                .to_owned(),
+            )),
+            UnaryOp::Void => Ok(Value::Undefined),
+            UnaryOp::Delete => Err(EngineError::new(
+                "InternalError",
+                "Delete expressions are not supported by bytecode",
+                1,
+                1,
+            )),
+        }
+    }
+
+    fn binary(
+        &mut self,
+        operator: BinaryOp,
+        left: Value,
+        right: Value,
+        cache: &mut vm::InlineCache,
+    ) -> Result<Value, EngineError> {
+        if cache.record_binary(&left, &right)
+            && let (Value::Number(left), Value::Number(right)) = (&left, &right)
+        {
+            let result = match operator {
+                BinaryOp::Add => Some(left + right),
+                BinaryOp::Subtract => Some(left - right),
+                BinaryOp::Multiply => Some(left * right),
+                BinaryOp::Divide => Some(left / right),
+                BinaryOp::Remainder => Some(left % right),
+                BinaryOp::Exponent => Some(left.powf(*right)),
+                _ => None,
+            };
+            if let Some(result) = result {
+                return Ok(Value::Number(result));
+            }
+        }
+        self.evaluate_binary(operator, left, right)
+    }
 }
 
 impl Default for Engine {

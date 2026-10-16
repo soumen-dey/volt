@@ -61,6 +61,10 @@ The interpreter currently supports:
   identifier runs and horizontal whitespace, with a portable scalar fallback;
   identifier and operator token text borrows the source instead of allocating
   per token
+- a compact 16-bit-word bytecode VM for literals, binding reads, unary
+  expressions, and eager binary expressions, with function-table dispatch,
+  guarded binding inline caches, and numeric operand type feedback; unsupported
+  expression forms continue through the AST evaluator
 - a persistent global environment across evaluations
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
@@ -83,6 +87,9 @@ garbage-collection weak-reference behavior because the runtime has no garbage
 collector.
 SIMD scanning currently accelerates ASCII identifier runs and spaces/tabs;
 string decoding, token storage, and AST construction still allocate.
+The bytecode VM is an initial expression-execution path, not a replacement for
+the AST evaluator. Its function-table dispatch is not a direct-threaded
+interpreter, and no comparative speedup is claimed.
 Some array methods,
 complete string/number behavior, RegExp literal parsing and the complete set of
 RegExp/String integration algorithms and edge cases, `Symbol`, `BigInt`, `Proxy`,
