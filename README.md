@@ -65,7 +65,9 @@ The interpreter currently supports:
   and binary expressions, short-circuit/conditional branches, and a subset of
   statement control flow (`if`, `while`, and classic `for`); it has function-
   table dispatch, guarded binding inline caches, and numeric operand type
-  feedback, while unsupported forms continue through the AST evaluator
+  feedback; supported user functions tier from AST interpretation to bytecode
+  after three calls or 32 interpreted loop iterations, while unsupported forms
+  continue through the AST evaluator
 - a two-tier x86-64 native JIT for side-effect-free numeric expressions using
   numeric literals and numeric bindings: a baseline template emitter runs on
   first use, then the Turbovolt Sea-of-Nodes backend applies constant folding,
@@ -100,12 +102,15 @@ string decoding, token storage, and AST construction still allocate.
 The bytecode VM is an initial execution path, not a replacement for the AST
 evaluator. Its supported statements include `if`, `while`, and classic `for`,
 with `break` and `continue`; lexical declarations in nested blocks, `do...while`,
-`for...of`, and exceptions fall back to the AST evaluator. User-function
-invocation now executes supported bodies in VM frames, including parameters,
-closure binding reads, loop control, and returns. Unsupported bodies fall back
-as a whole to the AST evaluator; bytecode is currently compiled per invocation.
-Its function-table dispatch is not a direct-threaded interpreter, and no
-comparative speedup is claimed.
+`for...of`, and exceptions fall back to the AST evaluator. User functions
+start in AST interpretation and supported bodies tier to VM frames after three
+calls or 32 interpreted loop iterations. Per-function profiles persist for
+the function object's lifetime and collect interpreted loop iterations,
+bytecode loop backedges, and numeric/generic operand type feedback from VM
+execution. Bytecode is still compiled per invocation; this tier is not native
+code generation. Unsupported bodies stay on the AST evaluator. Dispatch is
+function-table based, not direct-threaded, and no comparative speedup is
+claimed.
 The collector allocates object handles from a stable arena, reuses reclaimed
 slots, and performs minor collections after 256 object allocations. Survivors
 are promoted; a full collection runs every eight minor collections or when
@@ -121,8 +126,9 @@ Windows where executable memory is permitted.
 Non-numeric bindings, other expressions, and other platforms continue through
 the VM/interpreter. The optimizing IR has no heap allocation nodes yet, so its
 allocation check does not constitute general object escape analysis; there is
-no JIT speedup claim. Tiering data and compiled code are scoped to one
-evaluation or function invocation.
+no JIT speedup claim. Native expression-JIT data remains scoped to an
+evaluation or function invocation; per-function VM tiering profiles persist
+with their function objects.
 Some array methods,
 complete string/number behavior, RegExp literal parsing and the complete set of
 RegExp/String integration algorithms and edge cases, `Symbol`, `BigInt`, `Proxy`,

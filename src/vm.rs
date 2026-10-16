@@ -33,6 +33,7 @@ enum Opcode {
     SetResult = 14,
     ClearResult = 15,
     FunctionReturn = 16,
+    LoopBackedge = 17,
 }
 
 pub(crate) struct Bytecode {
@@ -44,6 +45,15 @@ pub(crate) struct Bytecode {
 pub(crate) enum Flow {
     Complete(Value),
     Return(Value),
+}
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Feedback {
+    pub(crate) loop_backedges: u64,
+    pub(crate) numeric_operations: u64,
+    pub(crate) generic_operations: u64,
+    pub(crate) left_types: u8,
+    pub(crate) right_types: u8,
 }
 
 type DispatchHandler<H> = fn(&mut Frame<'_, H>, usize) -> Result<(), EngineError>;
@@ -93,7 +103,7 @@ impl Bytecode {
         host: &mut H,
         scope: usize,
     ) -> Result<Value, EngineError> {
-        match self.run_flow(host, scope)? {
+        match self.run_flow(host, scope)?.0 {
             Flow::Complete(value) | Flow::Return(value) => Ok(value),
         }
     }
@@ -102,11 +112,15 @@ impl Bytecode {
         &mut self,
         host: &mut H,
         scope: usize,
-    ) -> Result<Flow, EngineError> {
+    ) -> Result<(Flow, Feedback), EngineError> {
         self.run_flow(host, scope)
     }
 
-    fn run_flow<H: Host>(&mut self, host: &mut H, scope: usize) -> Result<Flow, EngineError> {
+    fn run_flow<H: Host>(
+        &mut self,
+        host: &mut H,
+        scope: usize,
+    ) -> Result<(Flow, Feedback), EngineError> {
         let words = &self.words;
         let constants = &self.constants;
         let caches = &mut self.caches;
@@ -120,8 +134,9 @@ impl Bytecode {
             scope,
             result: None,
             completion: Value::Undefined,
+            feedback: Feedback::default(),
         };
-        let dispatch: [DispatchHandler<H>; 17] = [
+        let dispatch: [DispatchHandler<H>; 18] = [
             dispatch_load_constant::<H>,
             dispatch_load_binding::<H>,
             dispatch_unary::<H>,
@@ -139,6 +154,7 @@ impl Bytecode {
             dispatch_set_result::<H>,
             dispatch_clear_result::<H>,
             dispatch_function_return::<H>,
+            dispatch_loop_backedge::<H>,
         ];
 
         while frame.result.is_none() {
@@ -163,13 +179,14 @@ impl Bytecode {
                 value if value == Opcode::SetResult as u16 => Opcode::SetResult,
                 value if value == Opcode::ClearResult as u16 => Opcode::ClearResult,
                 value if value == Opcode::FunctionReturn as u16 => Opcode::FunctionReturn,
+                value if value == Opcode::LoopBackedge as u16 => Opcode::LoopBackedge,
                 _ => return Err(invalid_bytecode()),
             };
             let site = frame.pc - 1;
             dispatch[opcode as usize](&mut frame, site)?;
         }
 
-        frame.result.ok_or_else(invalid_bytecode)
+        Ok((frame.result.ok_or_else(invalid_bytecode)?, frame.feedback))
     }
 }
 
@@ -425,6 +442,7 @@ impl Compiler {
                 self.statement(body)?;
                 self.statement_depth -= 1;
                 let continue_target = self.words.len();
+                self.emit(Opcode::LoopBackedge);
                 self.emit_jump_to(Opcode::Jump, loop_start)?;
                 let loop_end = self.words.len();
                 self.patch_jump_to(exit_jump, loop_end)?;
@@ -471,6 +489,7 @@ impl Compiler {
                     self.expression(update)?;
                     self.emit(Opcode::SetResult);
                 }
+                self.emit(Opcode::LoopBackedge);
                 self.emit_jump_to(Opcode::Jump, loop_start)?;
                 let loop_end = self.words.len();
                 if let Some(exit_jump) = exit_jump {
@@ -645,6 +664,7 @@ struct Frame<'a, H> {
     scope: usize,
     result: Option<Flow>,
     completion: Value,
+    feedback: Feedback,
 }
 
 fn dispatch_load_constant<H: Host>(
@@ -748,6 +768,13 @@ fn dispatch_function_return<H: Host>(
     frame.function_return(site)
 }
 
+fn dispatch_loop_backedge<H: Host>(
+    frame: &mut Frame<'_, H>,
+    site: usize,
+) -> Result<(), EngineError> {
+    frame.loop_backedge(site)
+}
+
 impl<H: Host> Frame<'_, H> {
     fn read_word(&mut self) -> Result<u16, EngineError> {
         let word = self
@@ -791,6 +818,13 @@ impl<H: Host> Frame<'_, H> {
         let operator = decode_binary(self.read_word()?)?;
         let right = self.stack.pop().ok_or_else(invalid_bytecode)?;
         let left = self.stack.pop().ok_or_else(invalid_bytecode)?;
+        self.feedback.left_types |= value_type_mask(&left);
+        self.feedback.right_types |= value_type_mask(&right);
+        if matches!(left, Value::Number(_)) && matches!(right, Value::Number(_)) {
+            self.feedback.numeric_operations = self.feedback.numeric_operations.saturating_add(1);
+        } else {
+            self.feedback.generic_operations = self.feedback.generic_operations.saturating_add(1);
+        }
         self.stack.push(
             self.host
                 .binary(operator, left, right, &mut self.caches[site])?,
@@ -815,6 +849,11 @@ impl<H: Host> Frame<'_, H> {
             return Err(invalid_bytecode());
         }
         self.result = self.stack.pop().map(Flow::Return);
+        Ok(())
+    }
+
+    fn loop_backedge(&mut self, _: usize) -> Result<(), EngineError> {
+        self.feedback.loop_backedges = self.feedback.loop_backedges.saturating_add(1);
         Ok(())
     }
 

@@ -16,6 +16,47 @@ type ScopeId = usize;
 
 const NURSERY_ALLOCATION_LIMIT: usize = 256;
 const MAJOR_COLLECTION_INTERVAL: usize = 8;
+const FUNCTION_TIER_THRESHOLD: u64 = 3;
+const LOOP_TIER_THRESHOLD: u64 = 32;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FunctionTier {
+    #[default]
+    Interpreted,
+    Bytecode,
+}
+
+#[derive(Default)]
+struct FunctionProfile {
+    invocations: u64,
+    loop_iterations: u64,
+    loop_backedges: u64,
+    numeric_operations: u64,
+    generic_operations: u64,
+    left_types: u8,
+    right_types: u8,
+    tier: FunctionTier,
+}
+
+impl FunctionProfile {
+    fn is_hot(&self) -> bool {
+        self.invocations >= FUNCTION_TIER_THRESHOLD
+            || self.loop_iterations >= LOOP_TIER_THRESHOLD
+            || self.loop_backedges >= LOOP_TIER_THRESHOLD
+    }
+
+    fn record_vm_feedback(&mut self, feedback: vm::Feedback) {
+        self.loop_backedges = self.loop_backedges.saturating_add(feedback.loop_backedges);
+        self.numeric_operations = self
+            .numeric_operations
+            .saturating_add(feedback.numeric_operations);
+        self.generic_operations = self
+            .generic_operations
+            .saturating_add(feedback.generic_operations);
+        self.left_types |= feedback.left_types;
+        self.right_types |= feedback.right_types;
+    }
+}
 
 fn mark_object(object: ObjectId, marked: &mut [bool], queue: &mut VecDeque<ObjectId>) {
     if let Some(is_marked) = marked.get_mut(object)
@@ -321,6 +362,8 @@ pub struct Engine {
     random_state: u64,
     bytecode_cache: Vec<HashMap<usize, vm::Bytecode>>,
     jit_cache: Vec<jit::JitCache>,
+    function_profiles: HashMap<ObjectId, FunctionProfile>,
+    active_function_stack: Vec<ObjectId>,
 }
 
 impl Engine {
@@ -357,6 +400,8 @@ impl Engine {
             strict: false,
             bytecode_cache: Vec::new(),
             jit_cache: Vec::new(),
+            function_profiles: HashMap::new(),
+            active_function_stack: Vec::new(),
             random_state: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_nanos() as u64)
@@ -1123,6 +1168,7 @@ impl Engine {
             ..Object::default()
         };
         let id = if let Some(id) = self.free_objects.pop() {
+            self.function_profiles.remove(&id);
             self.objects[id] = object;
             self.object_ages[id] = 0;
             self.object_live[id] = true;
@@ -1223,6 +1269,7 @@ impl Engine {
                 self.objects[id] = Object::default();
                 self.object_ages[id] = 0;
                 self.object_live[id] = false;
+                self.function_profiles.remove(&id);
                 self.free_objects.push(id);
                 reclaimed += 1;
             } else if self.object_live[id] && is_marked && self.object_ages[id] == 0 {
@@ -1728,6 +1775,13 @@ impl Engine {
         Ok(Completion::Normal(result))
     }
 
+    fn record_function_loop_iteration(&mut self) {
+        if let Some(function) = self.active_function_stack.last().copied() {
+            let profile = self.function_profiles.entry(function).or_default();
+            profile.loop_iterations = profile.loop_iterations.saturating_add(1);
+        }
+    }
+
     fn instantiate_declarations(
         &mut self,
         statements: &[Stmt],
@@ -1889,6 +1943,7 @@ impl Engine {
             Stmt::While { condition, body } => {
                 let mut result = Value::Undefined;
                 while self.evaluate(condition, scope)?.is_truthy() {
+                    self.record_function_loop_iteration();
                     match self.execute_statement(body, scope)? {
                         Completion::Normal(value) => result = value,
                         completion @ Completion::Return(_) => return Ok(completion),
@@ -1924,6 +1979,7 @@ impl Engine {
                     Some(condition) => self.evaluate(condition, loop_scope)?.is_truthy(),
                     None => true,
                 } {
+                    self.record_function_loop_iteration();
                     match self.execute_statement(body, loop_scope)? {
                         Completion::Normal(value) => result = value,
                         completion @ Completion::Return(_) => return Ok(completion),
@@ -1952,6 +2008,7 @@ impl Engine {
                 let values = self.for_each_values(iterable, *is_of)?;
                 let mut result = Value::Undefined;
                 for value in values {
+                    self.record_function_loop_iteration();
                     let iteration_scope = if *kind == DeclarationKind::Var {
                         let target = self.var_scope(scope);
                         self.assign_binding(target, name, value, 1, 1)?;
@@ -1980,6 +2037,7 @@ impl Engine {
             Stmt::DoWhile { body, condition } => {
                 let mut result = Value::Undefined;
                 loop {
+                    self.record_function_loop_iteration();
                     match self.execute_statement(body, scope)? {
                         Completion::Normal(value) => result = value,
                         completion @ Completion::Return(_) => return Ok(completion),
@@ -3316,21 +3374,37 @@ impl Engine {
                 self.strict = strict;
                 self.bytecode_cache.push(HashMap::new());
                 self.jit_cache.push(jit::JitCache::default());
-                let result = if let Some(mut bytecode) = vm::Bytecode::compile_function(&body) {
-                    match self.instantiate_declarations(&body, function_scope) {
-                        Err(error) => Err(error),
-                        Ok(()) => {
-                            bytecode
-                                .run_function(self, function_scope)
-                                .map(|flow| match flow {
-                                    vm::Flow::Complete(value) => Completion::Normal(value),
-                                    vm::Flow::Return(value) => Completion::Return(value),
-                                })
-                        }
-                    }
-                } else {
-                    self.execute_statements(&body, function_scope)
+                let use_bytecode = {
+                    let profile = self.function_profiles.entry(id).or_default();
+                    profile.invocations = profile.invocations.saturating_add(1);
+                    profile.is_hot()
                 };
+                self.active_function_stack.push(id);
+                let result =
+                    if use_bytecode
+                        && let Some(mut bytecode) = vm::Bytecode::compile_function(&body)
+                    {
+                        match self.instantiate_declarations(&body, function_scope) {
+                            Err(error) => Err(error),
+                            Ok(()) => bytecode.run_function(self, function_scope).map(
+                                |(flow, feedback)| {
+                                    let profile = self
+                                        .function_profiles
+                                        .get_mut(&id)
+                                        .expect("function profile was initialized");
+                                    profile.tier = FunctionTier::Bytecode;
+                                    profile.record_vm_feedback(feedback);
+                                    match flow {
+                                        vm::Flow::Complete(value) => Completion::Normal(value),
+                                        vm::Flow::Return(value) => Completion::Return(value),
+                                    }
+                                },
+                            ),
+                        }
+                    } else {
+                        self.execute_statements(&body, function_scope)
+                    };
+                self.active_function_stack.pop();
                 self.jit_cache.pop();
                 self.bytecode_cache.pop();
                 self.strict = previous_strict;
@@ -7659,7 +7733,7 @@ fn collect_var_names(statements: &[Stmt], names: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, Value};
+    use super::{Engine, FUNCTION_TIER_THRESHOLD, FunctionTier, LOOP_TIER_THRESHOLD, Value};
 
     #[test]
     fn evaluates_precedence_and_persistent_bindings() {
@@ -7743,6 +7817,101 @@ mod tests {
             "function makeCounter() { let n = 0; return function() { n = n + 1; return n; }; } let counter = makeCounter(); counter(); counter()",
         ).unwrap();
         assert_eq!(value, "2");
+    }
+
+    #[test]
+    fn hot_functions_promote_to_vm_with_persistent_type_feedback() {
+        let mut engine = Engine::new();
+        engine
+            .eval("function tierProfileProbe(value) { return value + 1; }")
+            .unwrap();
+        let Value::Object(function) =
+            &engine.scopes[engine.global].bindings["tierProfileProbe"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        let function = *function;
+
+        assert_eq!(
+            engine.eval("tierProfileProbe(2)").unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            engine.function_profiles[&function].tier,
+            FunctionTier::Interpreted
+        );
+        assert_eq!(
+            engine.eval("tierProfileProbe(3)").unwrap(),
+            Value::Number(4.0)
+        );
+        assert_eq!(
+            engine.eval("tierProfileProbe(4)").unwrap(),
+            Value::Number(5.0)
+        );
+        let profile = &engine.function_profiles[&function];
+        assert_eq!(profile.invocations, 3);
+        assert_eq!(profile.tier, FunctionTier::Bytecode);
+        assert_eq!(profile.numeric_operations, 1);
+        assert_ne!(profile.left_types & (1 << 3), 0);
+
+        assert_eq!(
+            engine.eval("tierProfileProbe('text')").unwrap(),
+            Value::String("text1".to_owned())
+        );
+        let profile = &engine.function_profiles[&function];
+        assert_eq!(profile.generic_operations, 1);
+        assert_ne!(profile.left_types & (1 << 4), 0);
+        assert_ne!(profile.right_types & (1 << 3), 0);
+    }
+
+    #[test]
+    fn loop_hotness_promotes_supported_function_on_later_call() {
+        let mut engine = Engine::new();
+        engine
+            .eval("function tierLoopProbe() { let i = 0; while (i < 40) { i = i + 1; } return i; }")
+            .unwrap();
+        let Value::Object(function) = &engine.scopes[engine.global].bindings["tierLoopProbe"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        let function = *function;
+
+        assert_eq!(engine.eval("tierLoopProbe()").unwrap(), Value::Number(40.0));
+        assert_eq!(
+            engine.function_profiles[&function].tier,
+            FunctionTier::Interpreted
+        );
+        assert!(engine.function_profiles[&function].loop_iterations >= LOOP_TIER_THRESHOLD);
+        assert_eq!(engine.eval("tierLoopProbe()").unwrap(), Value::Number(40.0));
+        let profile = &engine.function_profiles[&function];
+        assert_eq!(profile.tier, FunctionTier::Bytecode);
+        assert!(profile.loop_backedges >= LOOP_TIER_THRESHOLD);
+    }
+
+    #[test]
+    fn unsupported_hot_functions_remain_on_interpreter_fallback() {
+        let mut engine = Engine::new();
+        engine
+            .eval("function tierFallbackProbe(value) { return value(); }")
+            .unwrap();
+        let Value::Object(function) =
+            &engine.scopes[engine.global].bindings["tierFallbackProbe"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        let function = *function;
+
+        for _ in 0..FUNCTION_TIER_THRESHOLD {
+            assert!(
+                engine
+                    .eval("tierFallbackProbe(function() { return 7; })")
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            engine.function_profiles[&function].tier,
+            FunctionTier::Interpreted
+        );
     }
 
     #[test]
