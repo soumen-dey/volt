@@ -422,6 +422,8 @@ enum Node {
     Negate(usize),
     Variable(usize),
     Conditional(usize, usize, usize),
+    LogicalAnd(usize, usize),
+    LogicalOr(usize, usize),
 }
 
 struct SeaOfNodes {
@@ -481,6 +483,8 @@ impl SeaOfNodes {
                     crate::parser::BinaryOp::Subtract => Node::Subtract(left, right),
                     crate::parser::BinaryOp::Multiply => Node::Multiply(left, right),
                     crate::parser::BinaryOp::Divide => Node::Divide(left, right),
+                    crate::parser::BinaryOp::And => Node::LogicalAnd(left, right),
+                    crate::parser::BinaryOp::Or => Node::LogicalOr(left, right),
                     _ => return None,
                 }
             }
@@ -549,6 +553,20 @@ impl SeaOfNodes {
                         _ => Node::Conditional(test, consequent, alternate),
                     }
                 }
+                Node::LogicalAnd(left, right) => match optimized[replacements[left]] {
+                    Node::Constant(bits) if !number_is_truthy(f64::from_bits(bits)) => {
+                        optimized[replacements[left]]
+                    }
+                    Node::Constant(_) => optimized[replacements[right]],
+                    _ => Node::LogicalAnd(replacements[left], replacements[right]),
+                },
+                Node::LogicalOr(left, right) => match optimized[replacements[left]] {
+                    Node::Constant(bits) if number_is_truthy(f64::from_bits(bits)) => {
+                        optimized[replacements[left]]
+                    }
+                    Node::Constant(_) => optimized[replacements[right]],
+                    _ => Node::LogicalOr(replacements[left], replacements[right]),
+                },
                 constant => constant,
             };
 
@@ -582,6 +600,8 @@ impl SeaOfNodes {
                     | Node::Divide(_, _)
                     | Node::Negate(_)
                     | Node::Conditional(_, _, _)
+                    | Node::LogicalAnd(_, _)
+                    | Node::LogicalOr(_, _)
                     | Node::Variable(_)
             )
         })
@@ -622,8 +642,14 @@ impl SeaOfNodes {
             Node::Conditional(test, consequent, alternate) => {
                 compiler.emit_conditional(self, test, consequent, alternate)
             }
+            Node::LogicalAnd(left, right) => compiler.emit_conditional(self, left, right, left),
+            Node::LogicalOr(left, right) => compiler.emit_conditional(self, left, left, right),
         }
     }
+}
+
+fn number_is_truthy(value: f64) -> bool {
+    value != 0.0 && !value.is_nan()
 }
 
 fn collect_numeric_variables(expression: &Expr) -> Option<Vec<String>> {
@@ -646,7 +672,9 @@ fn collect_numeric_variables(expression: &Expr) -> Option<Vec<String>> {
                     crate::parser::BinaryOp::Add
                     | crate::parser::BinaryOp::Subtract
                     | crate::parser::BinaryOp::Multiply
-                    | crate::parser::BinaryOp::Divide,
+                    | crate::parser::BinaryOp::Divide
+                    | crate::parser::BinaryOp::And
+                    | crate::parser::BinaryOp::Or,
                 left,
                 right,
             } => {

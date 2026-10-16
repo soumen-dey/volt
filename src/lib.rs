@@ -8075,6 +8075,77 @@ mod tests {
     }
 
     #[test]
+    fn optimizing_ir_preserves_numeric_logical_short_circuit_results() {
+        let mut engine = Engine::new();
+        engine
+            .eval(
+                "function tierAndProbe(value) { return value && value + 2; } function tierOrProbe(value) { return value || value + 2; }",
+            )
+            .unwrap();
+
+        for source in [
+            "tierAndProbe(3)",
+            "tierAndProbe(0)",
+            "tierAndProbe(-4)",
+            "tierOrProbe(3)",
+            "tierOrProbe(0)",
+            "tierOrProbe(-4)",
+            "tierAndProbe(0 / 0)",
+            "tierOrProbe(0 / 0)",
+        ] {
+            let jit_value = engine.eval_to_string(source).unwrap();
+            let interpreter_value = {
+                let mut reference = Engine::new();
+                reference
+                    .eval(
+                        "function tierAndProbe(value) { return value && value + 2; } function tierOrProbe(value) { return value || value + 2; }",
+                    )
+                    .unwrap();
+                reference.eval_to_string(source).unwrap()
+            };
+            assert_eq!(jit_value, interpreter_value, "{source}");
+        }
+        let Value::Object(and_function) =
+            &engine.scopes[engine.global].bindings["tierAndProbe"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        let Value::Object(or_function) =
+            &engine.scopes[engine.global].bindings["tierOrProbe"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        let and_function = *and_function;
+        let or_function = *or_function;
+        assert_eq!(
+            engine.function_profiles[&and_function].tier,
+            FunctionTier::OptimizingJit
+        );
+        assert_eq!(
+            engine.function_profiles[&or_function].tier,
+            FunctionTier::OptimizingJit
+        );
+        for source in ["tierAndProbe('x')", "tierOrProbe('x')"] {
+            let jit_value = engine.eval_to_string(source).unwrap();
+            let mut reference = Engine::new();
+            reference
+                .eval(
+                    "function tierAndProbe(value) { return value && value + 2; } function tierOrProbe(value) { return value || value + 2; }",
+                )
+                .unwrap();
+            assert_eq!(jit_value, reference.eval_to_string(source).unwrap());
+        }
+        assert_eq!(
+            engine.function_profiles[&and_function].native_jit_deoptimizations,
+            1
+        );
+        assert_eq!(
+            engine.function_profiles[&or_function].native_jit_deoptimizations,
+            1
+        );
+    }
+
+    #[test]
     fn objects_support_properties_prototypes_and_method_this() {
         let mut engine = Engine::new();
         let value = engine.eval_to_string(
