@@ -1793,14 +1793,12 @@ impl Engine {
     fn run_function_jit(
         &mut self,
         function: ObjectId,
+        parameters: &[String],
         body: &[Stmt],
         scope: ScopeId,
-    ) -> Option<(f64, jit::FunctionJitTier)> {
-        let [Stmt::Return(Some(expression))] = body else {
-            return None;
-        };
+    ) -> Option<(Value, jit::FunctionJitTier)> {
         if let std::collections::hash_map::Entry::Vacant(slot) = self.function_jit.entry(function) {
-            let compiled = jit::FunctionJit::compile(expression)?;
+            let compiled = jit::FunctionJit::compile(parameters, body)?;
             slot.insert(compiled);
         }
         let variables = self.function_jit.get(&function)?.variables().to_vec();
@@ -3419,7 +3417,7 @@ impl Engine {
                 };
                 self.active_function_stack.push(id);
                 let native_result = if use_bytecode {
-                    self.run_function_jit(id, &body, function_scope)
+                    self.run_function_jit(id, &parameters, &body, function_scope)
                 } else {
                     None
                 };
@@ -3433,7 +3431,7 @@ impl Engine {
                         jit::FunctionJitTier::Optimizing => FunctionTier::OptimizingJit,
                     };
                     profile.native_jit_executions = profile.native_jit_executions.saturating_add(1);
-                    Ok(Completion::Return(Value::Number(value)))
+                    Ok(Completion::Return(value))
                 } else {
                     if use_bytecode && self.function_jit.contains_key(&id) {
                         let profile = self
@@ -8142,6 +8140,174 @@ mod tests {
         assert_eq!(
             engine.function_profiles[&or_function].native_jit_deoptimizations,
             1
+        );
+    }
+
+    #[test]
+    fn optimizing_ir_compiles_numeric_comparisons_with_nan_semantics() {
+        let mut engine = Engine::new();
+        engine
+            .eval(
+                "function tierLt(a, b) { return a < b; } function tierLte(a, b) { return a <= b; } function tierGt(a, b) { return a > b; } function tierGte(a, b) { return a >= b; } function tierEq(a, b) { return a === b; } function tierNe(a, b) { return a !== b; } function tierCompareSelect(a, b) { return a > b ? a : b; } function tierBooleanSelect(a, b) { return a > b ? a !== b : a === b; } function tierBooleanLogic(a, b) { return (a > 0) && (b > 0); }",
+            )
+            .unwrap();
+        let cases = [
+            ("tierLt(1, 2)", Value::Boolean(true)),
+            ("tierLt(2, 1)", Value::Boolean(false)),
+            ("tierLte(2, 2)", Value::Boolean(true)),
+            ("tierLt(0 / 0, 1)", Value::Boolean(false)),
+            ("tierLte(0 / 0, 1)", Value::Boolean(false)),
+            ("tierGt(3, 2)", Value::Boolean(true)),
+            ("tierGt(0 / 0, 1)", Value::Boolean(false)),
+            ("tierGte(2, 2)", Value::Boolean(true)),
+            ("tierGte(0 / 0, 1)", Value::Boolean(false)),
+            ("tierEq(0, -0)", Value::Boolean(true)),
+            ("tierEq(0 / 0, 0 / 0)", Value::Boolean(false)),
+            ("tierNe(0 / 0, 0 / 0)", Value::Boolean(true)),
+            ("tierCompareSelect(8, 3)", Value::Number(8.0)),
+            ("tierCompareSelect(1, 3)", Value::Number(3.0)),
+            ("tierBooleanSelect(3, 2)", Value::Boolean(true)),
+            ("tierBooleanSelect(2, 3)", Value::Boolean(false)),
+            ("tierBooleanLogic(1, 0)", Value::Boolean(false)),
+            ("tierBooleanLogic(1, 2)", Value::Boolean(true)),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(engine.eval(source).unwrap(), expected, "{source}");
+        }
+
+        for name in [
+            "tierLt",
+            "tierLte",
+            "tierGt",
+            "tierGte",
+            "tierEq",
+            "tierNe",
+            "tierCompareSelect",
+            "tierBooleanSelect",
+            "tierBooleanLogic",
+        ] {
+            for _ in 0..FUNCTION_TIER_THRESHOLD {
+                engine.eval(&format!("{name}(1, 2)")).unwrap();
+            }
+            let Value::Object(function) = &engine.scopes[engine.global].bindings[name].value else {
+                panic!("function declaration should create an object");
+            };
+            assert_eq!(
+                engine.function_profiles[function].tier,
+                FunctionTier::OptimizingJit,
+                "{name}"
+            );
+        }
+        for (source, expected) in [
+            ("tierLt(1, 2)", Value::Boolean(true)),
+            ("tierLte(3, 2)", Value::Boolean(false)),
+            ("tierGt(3, 2)", Value::Boolean(true)),
+            ("tierGte(1, 2)", Value::Boolean(false)),
+            ("tierEq(2, 2)", Value::Boolean(true)),
+            ("tierNe(2, 2)", Value::Boolean(false)),
+            ("tierLt(0 / 0, 1)", Value::Boolean(false)),
+            ("tierLte(0 / 0, 1)", Value::Boolean(false)),
+            ("tierGt(0 / 0, 1)", Value::Boolean(false)),
+            ("tierGte(0 / 0, 1)", Value::Boolean(false)),
+            ("tierEq(0 / 0, 0 / 0)", Value::Boolean(false)),
+            ("tierNe(0 / 0, 0 / 0)", Value::Boolean(true)),
+            ("tierBooleanSelect(3, 2)", Value::Boolean(true)),
+            ("tierBooleanLogic(1, 2)", Value::Boolean(true)),
+        ] {
+            assert_eq!(engine.eval(source).unwrap(), expected, "{source}");
+        }
+        assert_eq!(
+            engine.eval("tierLt('10', '2')").unwrap(),
+            Value::Boolean(true)
+        );
+        let Value::Object(less_than) = &engine.scopes[engine.global].bindings["tierLt"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        assert_eq!(
+            engine.function_profiles[less_than].native_jit_deoptimizations,
+            1
+        );
+    }
+
+    #[test]
+    fn optimizing_ir_compiles_counted_sum_loops_and_unrolls_small_constants() {
+        let mut engine = Engine::new();
+        engine
+            .eval(
+                "function tierDynamicSum(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = total + index; } return total; } function tierConstantSum() { let total = 0; for (let index = 0; index < 5; index++) { total = total + index; } return total; }",
+            )
+            .unwrap();
+
+        for _ in 0..FUNCTION_TIER_THRESHOLD {
+            assert_eq!(
+                engine.eval("tierDynamicSum(10)").unwrap(),
+                Value::Number(45.0)
+            );
+            assert_eq!(
+                engine.eval("tierConstantSum()").unwrap(),
+                Value::Number(10.0)
+            );
+        }
+        assert_eq!(
+            engine.eval("tierDynamicSum(0)").unwrap(),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            engine.eval("tierDynamicSum(3.5)").unwrap(),
+            Value::Number(6.0)
+        );
+        assert_eq!(
+            engine.eval("tierDynamicSum('3')").unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            engine.eval("tierDynamicSum(0 / 0)").unwrap(),
+            Value::Number(0.0)
+        );
+        for name in ["tierDynamicSum", "tierConstantSum"] {
+            let Value::Object(function) = &engine.scopes[engine.global].bindings[name].value else {
+                panic!("function declaration should create an object");
+            };
+            assert_eq!(
+                engine.function_profiles[function].tier,
+                FunctionTier::OptimizingJit,
+                "{name}"
+            );
+        }
+        let Value::Object(dynamic_sum) =
+            &engine.scopes[engine.global].bindings["tierDynamicSum"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        assert_eq!(
+            engine.function_profiles[dynamic_sum].native_jit_deoptimizations,
+            1
+        );
+    }
+
+    #[test]
+    fn unsupported_counted_loop_shapes_stay_on_vm_or_interpreter() {
+        let mut engine = Engine::new();
+        engine
+            .eval(
+                "function tierUnsupportedSum(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = total + index; if (index === 2) total = total + 1; } return total; }",
+            )
+            .unwrap();
+        for _ in 0..FUNCTION_TIER_THRESHOLD {
+            assert_eq!(
+                engine.eval("tierUnsupportedSum(5)").unwrap(),
+                Value::Number(11.0)
+            );
+        }
+        let Value::Object(function) =
+            &engine.scopes[engine.global].bindings["tierUnsupportedSum"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        assert_eq!(
+            engine.function_profiles[function].tier,
+            FunctionTier::Interpreted
         );
     }
 

@@ -69,12 +69,14 @@ The interpreter currently supports:
   after three calls or 32 interpreted loop iterations, then supported simple
   numeric return expressions can run in the baseline native tier; unsupported
   forms continue through the AST evaluator or VM
+- an optimizing native-IR path for one precisely recognized numeric counted
+  sum-loop shape; parameter-bounded loops emit native control flow, while
+  constant bounds up to 16 are unrolled and folded at compile time
 - a two-tier x86-64 native JIT for side-effect-free numeric expressions using
   numeric literals and numeric bindings: a baseline template emitter runs on
   first use, then the Turbovolt Sea-of-Nodes backend applies constant folding,
-  common-subexpression elimination, numeric conditional and logical
-  short-circuit control flow, and an allocation-free IR check after repeated
-  execution
+  common-subexpression elimination, numeric comparisons and conditional/logical
+  control flow, and an allocation-free IR check after repeated execution
 - a tracing generational object collector with arena-slot reuse, a young-object
   nursery, survivor promotion, closure/property/collection tracing, weak
   collection cleanup, automatic minor collections, and an explicit full
@@ -110,17 +112,18 @@ calls or 32 interpreted loop iterations. Per-function profiles persist for
 the function object's lifetime and collect interpreted loop iterations,
 bytecode loop backedges, and numeric/generic operand type feedback from VM
 execution. Bytecode is still compiled per invocation; this tier is not native
-code generation by itself. A hot function with one return expression made
-only of numeric literals, numeric local/parameter/closure bindings, unary
-negation, `+`, `-`, `*`, `/`, numeric conditional expressions, and numeric
-`&&`/`||` can additionally run in the x86-64 native tier. Simple arithmetic
-uses the baseline emitter; conditional and logical operations use the
-optimizing graph, which emits explicit branch/merge control flow and preserves
-short-circuit results. Only non-global bindings are eligible. It guards every
-binding as numeric on each call and falls back to VM or AST execution when a
-guard fails. Other function bodies remain interpreted or in VM bytecode.
-Dispatch is function-table based, not direct-threaded, and no comparative
-speedup is claimed.
+code generation by itself. Hot functions with a single supported numeric
+return expression can additionally run in the native tier. The optimizing
+graph supports numeric comparisons, conditional branches, and logical
+short-circuiting. Comparisons return JavaScript booleans and handle unordered
+`NaN` comparisons. It also recognizes one narrowly defined local counted-sum
+loop: zero-based induction, `total = total + index`, then returning `total`.
+Parameter-bounded loops execute as native loops; constant bounds from 0
+through 16 are unrolled and folded. Only numeric parameters/local bindings are
+eligible, with runtime guards and VM/interpreter fallback on failure. Other
+function and loop shapes remain interpreted or in VM bytecode. Dispatch is
+function-table based, not direct-threaded, and no comparative speedup is
+claimed.
 The collector allocates object handles from a stable arena, reuses reclaimed
 slots, and performs minor collections after 256 object allocations. Survivors
 are promoted; a full collection runs every eight minor collections or when
@@ -130,34 +133,50 @@ stop-the-world and single-threaded; pause duration depends on the reachable
 heap and is not guaranteed to stay below 150 μs. Values returned to the host
 are conservatively retained as roots for the lifetime of the engine because
 the API has no explicit host-root release handle.
-The native JIT accepts numeric literals and non-global numeric bindings,
-unary negation, `+`, `-`, `*`, `/`, and numeric conditional expressions on
-x86-64 Linux, macOS, and Windows where executable memory is permitted. Hot
-user functions can use this emitter for a single return expression, including
-numeric conditional and logical short-circuit operators; numeric guards send
-non-numeric inputs back to the VM/interpreter. Other expressions and
-platforms continue through the VM/interpreter. The optimizing graph now
-supports numeric conditional and logical control flow, but it is not a general
-SSA/Sea-of-Nodes compiler: loops, deoptimization state reconstruction, heap
-allocation nodes, and general escape analysis are not implemented. The
-allocation check only verifies that supported graph nodes are numeric and
-allocation-free. There is no JIT speedup claim. Native expression-JIT data
-remains scoped to an evaluation or function invocation; per-function VM
-tiering profiles and compiled baseline function code persist with their
-function objects.
-Some array methods,
-complete string/number behavior, RegExp literal parsing and the complete set of
-RegExp/String integration algorithms and edge cases, `Symbol`, `BigInt`, `Proxy`,
-`Reflect`, modules, promises/jobs, and many other specified APIs are not implemented.
-Classes, many constructor edge cases, complete `this` binding rules, and
-complete ECMAScript error objects are also missing. The parser and runtime
-semantics remain a limited subset; passing the focused Rust tests does not
-establish general ECMAScript conformance. Unsupported syntax reports a
-`SyntaxError`. Object and scope storage is engine-owned and reclaimed
-when the engine is dropped; long-running scripts can still retain reachable
-objects, and execution time, memory, and recursion limits are not enforced.
-This implementation must not be used to execute untrusted or unbounded
-scripts.
+The native JIT is available on x86-64 Linux, macOS, and Windows where
+executable memory is permitted. Numeric guards send nonnumeric arguments
+back through the VM/interpreter. Other expressions and platforms continue
+through the VM/interpreter. This is a limited optimizing graph, not a general
+SSA/Sea-of-Nodes compiler: it has no general deoptimization-state
+reconstruction, heap allocation nodes, or general escape analysis. Its
+allocation check only permits the explicitly supported allocation-free
+numeric nodes.
+
+SIMD auto-vectorization and speculative call devirtualization are not enabled.
+The currently supported numeric reduction has observable left-to-right
+binary64 rounding, and the VM has no call-site feedback/IR needed to safely
+specialize general calls. No JIT speedup or GC pause guarantee is claimed.
+Native expression-JIT data remains scoped to an evaluation or function
+invocation; per-function VM tiering profiles and compiled function code
+persist with their function objects.
+Some array methods, complete string/number behavior, RegExp literal parsing
+and the complete set of RegExp/String integration algorithms and edge cases,
+`Symbol`, `BigInt`, `Proxy`, `Reflect`, modules, promises/jobs, and many other
+specified APIs are not implemented. Classes, many constructor edge cases,
+complete `this` binding rules, and complete ECMAScript error objects are also
+missing. The parser and runtime semantics remain a limited subset; passing the
+focused Rust tests does not establish general ECMAScript conformance.
+
+## Benchmarks
+
+Run the dependency-free microbenchmark harness in release mode:
+
+```text
+cargo bench --bench runtime
+```
+
+It prints CSV-style elapsed time per operation for end-to-end arithmetic
+evaluation (including lexing/parsing), warmed native counted-sum calls,
+constant-loop unrolling, and full-collection pauses (median and p95 over 40
+samples). The harness reports target OS/architecture but does not control CPU
+frequency, thermal state, background load, or allocator state. Record the
+Rust compiler version and CPU model when comparing runs. Measurements are
+diagnostic, not portable performance claims.
+Unsupported syntax reports a `SyntaxError`. Object and scope storage is
+engine-owned and reclaimed when the engine is dropped; long-running scripts
+can still retain reachable objects, and execution time, memory, and recursion
+limits are not enforced. This implementation must not be used to execute
+untrusted or unbounded scripts.
 
 ## Run
 

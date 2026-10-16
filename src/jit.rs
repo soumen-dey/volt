@@ -1,6 +1,9 @@
 use std::{collections::HashMap, ffi::c_void, ptr::NonNull};
 
-use crate::{Value, parser::Expr};
+use crate::{
+    Value,
+    parser::{BinaryOp, DeclarationKind, Expr, Stmt},
+};
 
 const OPTIMIZE_AFTER: u32 = 8;
 
@@ -13,6 +16,7 @@ pub(crate) struct FunctionJit {
     variables: Vec<String>,
     baseline: NativeCode,
     tier: FunctionJitTier,
+    result: FunctionJitResult,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,8 +25,37 @@ pub(crate) enum FunctionJitTier {
     Optimizing,
 }
 
+#[derive(Clone, Copy)]
+enum FunctionJitResult {
+    Number,
+    Boolean,
+}
+
 impl FunctionJit {
-    pub(crate) fn compile(expression: &Expr) -> Option<Self> {
+    pub(crate) fn compile(parameters: &[String], body: &[Stmt]) -> Option<Self> {
+        if let Some(limit) = counted_sum_loop(parameters, body) {
+            let (variables, graph) = match limit {
+                LoopLimit::Constant(limit) => (Vec::new(), SeaOfNodes::unrolled_sum(limit)?),
+                LoopLimit::Parameter(name) => {
+                    let slot = parameters
+                        .iter()
+                        .rposition(|parameter| parameter == &name)?;
+                    (vec![name], SeaOfNodes::counted_sum(slot))
+                }
+            };
+            let graph = graph.optimize()?;
+            let baseline = NativeCode::compile(&graph.emit()?)?;
+            return Some(Self {
+                variables,
+                baseline,
+                tier: FunctionJitTier::Optimizing,
+                result: FunctionJitResult::Number,
+            });
+        }
+        let [Stmt::Return(Some(expression))] = body else {
+            return None;
+        };
+        let result = expression_result_kind(expression)?;
         if let Some((code, variables)) = BaselineCompiler::compile(expression)
             && let Some(baseline) = NativeCode::compile(&code)
         {
@@ -30,6 +63,7 @@ impl FunctionJit {
                 variables,
                 baseline,
                 tier: FunctionJitTier::Baseline,
+                result,
             });
         }
         let variables = collect_numeric_variables(expression)?;
@@ -39,6 +73,7 @@ impl FunctionJit {
             variables,
             baseline,
             tier: FunctionJitTier::Optimizing,
+            result,
         })
     }
 
@@ -46,13 +81,128 @@ impl FunctionJit {
         &self.variables
     }
 
-    pub(crate) fn run(&self, inputs: &[f64]) -> f64 {
-        self.baseline.call(inputs)
+    pub(crate) fn run(&self, inputs: &[f64]) -> Value {
+        let result = self.baseline.call(inputs);
+        match self.result {
+            FunctionJitResult::Number => Value::Number(result),
+            FunctionJitResult::Boolean => Value::Boolean(result != 0.0),
+        }
     }
 
     pub(crate) fn tier(&self) -> FunctionJitTier {
         self.tier
     }
+}
+
+enum LoopLimit {
+    Constant(f64),
+    Parameter(String),
+}
+
+fn identifier_is(expression: &Expr, expected: &str) -> bool {
+    matches!(expression, Expr::Identifier { name, .. } if name == expected)
+}
+
+fn counted_sum_loop(parameters: &[String], body: &[Stmt]) -> Option<LoopLimit> {
+    let [
+        Stmt::Declaration {
+            name: accumulator,
+            initializer: Some(Expr::Literal(Value::Number(initial_sum))),
+            kind: accumulator_kind,
+            ..
+        },
+        Stmt::For {
+            initializer: Some(initializer),
+            condition: Some(condition),
+            update: Some(update),
+            body: loop_body,
+        },
+        Stmt::Return(Some(return_value)),
+    ] = body
+    else {
+        return None;
+    };
+    if *initial_sum != 0.0
+        || !matches!(
+            accumulator_kind,
+            DeclarationKind::Let | DeclarationKind::Var
+        )
+        || !identifier_is(return_value, accumulator)
+    {
+        return None;
+    }
+    let Stmt::Declaration {
+        name: index,
+        initializer: Some(Expr::Literal(Value::Number(initial_index))),
+        kind: index_kind,
+        ..
+    } = initializer.as_ref()
+    else {
+        return None;
+    };
+    if *initial_index != 0.0
+        || !matches!(index_kind, DeclarationKind::Let | DeclarationKind::Var)
+        || accumulator == index
+        || parameters
+            .iter()
+            .any(|parameter| parameter == accumulator || parameter == index)
+    {
+        return None;
+    }
+    let Expr::Binary {
+        operator: BinaryOp::LessThan,
+        left,
+        right,
+    } = condition
+    else {
+        return None;
+    };
+    if !identifier_is(left, index) {
+        return None;
+    }
+    let limit = match right.as_ref() {
+        Expr::Literal(Value::Number(value)) => LoopLimit::Constant(*value),
+        Expr::Identifier { name, .. } if parameters.iter().any(|parameter| parameter == name) => {
+            LoopLimit::Parameter(name.clone())
+        }
+        _ => return None,
+    };
+    if !matches!(
+        update,
+        Expr::Update {
+            target,
+            increment: true,
+            ..
+        } if identifier_is(target, index)
+    ) {
+        return None;
+    }
+    let Stmt::Block(loop_statements) = loop_body.as_ref() else {
+        return None;
+    };
+    let [
+        Stmt::Expression(Expr::Assignment {
+            target,
+            value,
+            operator: None,
+        }),
+    ] = loop_statements.as_slice()
+    else {
+        return None;
+    };
+    if !identifier_is(target, accumulator)
+        || !matches!(
+            value.as_ref(),
+            Expr::Binary {
+                operator: BinaryOp::Add,
+                left,
+                right,
+            } if identifier_is(left, accumulator) && identifier_is(right, index)
+        )
+    {
+        return None;
+    }
+    Some(limit)
 }
 
 struct Entry {
@@ -424,6 +574,13 @@ enum Node {
     Conditional(usize, usize, usize),
     LogicalAnd(usize, usize),
     LogicalOr(usize, usize),
+    LessThan(usize, usize),
+    LessThanOrEqual(usize, usize),
+    GreaterThan(usize, usize),
+    GreaterThanOrEqual(usize, usize),
+    StrictEqual(usize, usize),
+    StrictNotEqual(usize, usize),
+    CountedSum(usize),
 }
 
 struct SeaOfNodes {
@@ -441,6 +598,29 @@ impl Turbovolt {
 }
 
 impl SeaOfNodes {
+    fn counted_sum(limit_slot: usize) -> Self {
+        Self {
+            nodes: vec![Node::CountedSum(limit_slot)],
+            root: 0,
+        }
+    }
+
+    fn unrolled_sum(limit: f64) -> Option<Self> {
+        if !limit.is_finite() || !(0.0..=16.0).contains(&limit) {
+            return None;
+        }
+        let mut nodes = vec![Node::Constant(0.0_f64.to_bits())];
+        let mut sum = 0;
+        for index in 0..limit.ceil() as usize {
+            let value = nodes.len();
+            nodes.push(Node::Constant((index as f64).to_bits()));
+            let next = nodes.len();
+            nodes.push(Node::Add(sum, value));
+            sum = next;
+        }
+        Some(Self { nodes, root: sum })
+    }
+
     fn compile(expression: &Expr, variables: &[String]) -> Option<Self> {
         let mut graph = Self {
             nodes: Vec::new(),
@@ -485,6 +665,14 @@ impl SeaOfNodes {
                     crate::parser::BinaryOp::Divide => Node::Divide(left, right),
                     crate::parser::BinaryOp::And => Node::LogicalAnd(left, right),
                     crate::parser::BinaryOp::Or => Node::LogicalOr(left, right),
+                    crate::parser::BinaryOp::LessThan => Node::LessThan(left, right),
+                    crate::parser::BinaryOp::LessThanOrEqual => Node::LessThanOrEqual(left, right),
+                    crate::parser::BinaryOp::GreaterThan => Node::GreaterThan(left, right),
+                    crate::parser::BinaryOp::GreaterThanOrEqual => {
+                        Node::GreaterThanOrEqual(left, right)
+                    }
+                    crate::parser::BinaryOp::StrictEqual => Node::StrictEqual(left, right),
+                    crate::parser::BinaryOp::StrictNotEqual => Node::StrictNotEqual(left, right),
                     _ => return None,
                 }
             }
@@ -567,6 +755,58 @@ impl SeaOfNodes {
                     Node::Constant(_) => optimized[replacements[right]],
                     _ => Node::LogicalOr(replacements[left], replacements[right]),
                 },
+                Node::LessThan(left, right) => fold_comparison(
+                    &optimized,
+                    replacements[left],
+                    replacements[right],
+                    |left, right| left < right,
+                )
+                .unwrap_or(Node::LessThan(replacements[left], replacements[right])),
+                Node::LessThanOrEqual(left, right) => fold_comparison(
+                    &optimized,
+                    replacements[left],
+                    replacements[right],
+                    |left, right| left <= right,
+                )
+                .unwrap_or(Node::LessThanOrEqual(
+                    replacements[left],
+                    replacements[right],
+                )),
+                Node::GreaterThan(left, right) => fold_comparison(
+                    &optimized,
+                    replacements[left],
+                    replacements[right],
+                    |left, right| left > right,
+                )
+                .unwrap_or(Node::GreaterThan(replacements[left], replacements[right])),
+                Node::GreaterThanOrEqual(left, right) => fold_comparison(
+                    &optimized,
+                    replacements[left],
+                    replacements[right],
+                    |left, right| left >= right,
+                )
+                .unwrap_or(Node::GreaterThanOrEqual(
+                    replacements[left],
+                    replacements[right],
+                )),
+                Node::StrictEqual(left, right) => fold_comparison(
+                    &optimized,
+                    replacements[left],
+                    replacements[right],
+                    |left, right| left == right,
+                )
+                .unwrap_or(Node::StrictEqual(replacements[left], replacements[right])),
+                Node::StrictNotEqual(left, right) => fold_comparison(
+                    &optimized,
+                    replacements[left],
+                    replacements[right],
+                    |left, right| left != right,
+                )
+                .unwrap_or(Node::StrictNotEqual(
+                    replacements[left],
+                    replacements[right],
+                )),
+                Node::CountedSum(limit) => Node::CountedSum(limit),
                 constant => constant,
             };
 
@@ -602,6 +842,13 @@ impl SeaOfNodes {
                     | Node::Conditional(_, _, _)
                     | Node::LogicalAnd(_, _)
                     | Node::LogicalOr(_, _)
+                    | Node::LessThan(_, _)
+                    | Node::LessThanOrEqual(_, _)
+                    | Node::GreaterThan(_, _)
+                    | Node::GreaterThanOrEqual(_, _)
+                    | Node::StrictEqual(_, _)
+                    | Node::StrictNotEqual(_, _)
+                    | Node::CountedSum(_)
                     | Node::Variable(_)
             )
         })
@@ -644,6 +891,15 @@ impl SeaOfNodes {
             }
             Node::LogicalAnd(left, right) => compiler.emit_conditional(self, left, right, left),
             Node::LogicalOr(left, right) => compiler.emit_conditional(self, left, left, right),
+            Node::LessThan(left, right)
+            | Node::LessThanOrEqual(left, right)
+            | Node::GreaterThan(left, right)
+            | Node::GreaterThanOrEqual(left, right)
+            | Node::StrictEqual(left, right)
+            | Node::StrictNotEqual(left, right) => {
+                compiler.emit_comparison(self, left, right, self.nodes[index])
+            }
+            Node::CountedSum(limit_slot) => compiler.emit_counted_sum(limit_slot),
         }
     }
 }
@@ -674,7 +930,13 @@ fn collect_numeric_variables(expression: &Expr) -> Option<Vec<String>> {
                     | crate::parser::BinaryOp::Multiply
                     | crate::parser::BinaryOp::Divide
                     | crate::parser::BinaryOp::And
-                    | crate::parser::BinaryOp::Or,
+                    | crate::parser::BinaryOp::Or
+                    | crate::parser::BinaryOp::LessThan
+                    | crate::parser::BinaryOp::LessThanOrEqual
+                    | crate::parser::BinaryOp::GreaterThan
+                    | crate::parser::BinaryOp::GreaterThanOrEqual
+                    | crate::parser::BinaryOp::StrictEqual
+                    | crate::parser::BinaryOp::StrictNotEqual,
                 left,
                 right,
             } => {
@@ -699,7 +961,192 @@ fn collect_numeric_variables(expression: &Expr) -> Option<Vec<String>> {
     Some(variables)
 }
 
+fn expression_result_kind(expression: &Expr) -> Option<FunctionJitResult> {
+    match expression {
+        Expr::Literal(Value::Number(_)) | Expr::Identifier { .. } => {
+            Some(FunctionJitResult::Number)
+        }
+        Expr::Unary {
+            operator: crate::parser::UnaryOp::Minus,
+            operand,
+            ..
+        } if matches!(expression_result_kind(operand)?, FunctionJitResult::Number) => {
+            Some(FunctionJitResult::Number)
+        }
+        Expr::Binary {
+            operator:
+                crate::parser::BinaryOp::Add
+                | crate::parser::BinaryOp::Subtract
+                | crate::parser::BinaryOp::Multiply
+                | crate::parser::BinaryOp::Divide,
+            left,
+            right,
+        } => {
+            expression_result_kind(left)?;
+            expression_result_kind(right)?;
+            Some(FunctionJitResult::Number)
+        }
+        Expr::Binary {
+            operator:
+                crate::parser::BinaryOp::LessThan
+                | crate::parser::BinaryOp::LessThanOrEqual
+                | crate::parser::BinaryOp::GreaterThan
+                | crate::parser::BinaryOp::GreaterThanOrEqual
+                | crate::parser::BinaryOp::StrictEqual
+                | crate::parser::BinaryOp::StrictNotEqual,
+            left,
+            right,
+        } => {
+            if !matches!(expression_result_kind(left)?, FunctionJitResult::Number)
+                || !matches!(expression_result_kind(right)?, FunctionJitResult::Number)
+            {
+                return None;
+            }
+            Some(FunctionJitResult::Boolean)
+        }
+        Expr::Binary {
+            operator: crate::parser::BinaryOp::And | crate::parser::BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let left_kind = expression_result_kind(left)?;
+            let right_kind = expression_result_kind(right)?;
+            match (left_kind, right_kind) {
+                (FunctionJitResult::Number, FunctionJitResult::Number) => {
+                    Some(FunctionJitResult::Number)
+                }
+                (FunctionJitResult::Boolean, FunctionJitResult::Boolean) => {
+                    Some(FunctionJitResult::Boolean)
+                }
+                _ => None,
+            }
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expression_result_kind(test)?;
+            let consequent = expression_result_kind(consequent)?;
+            let alternate = expression_result_kind(alternate)?;
+            match (consequent, alternate) {
+                (FunctionJitResult::Number, FunctionJitResult::Number) => {
+                    Some(FunctionJitResult::Number)
+                }
+                (FunctionJitResult::Boolean, FunctionJitResult::Boolean) => {
+                    Some(FunctionJitResult::Boolean)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 impl BaselineCompiler {
+    fn emit_counted_sum(&mut self, limit_slot: usize) -> Option<()> {
+        if self.stack_depth != 0 || limit_slot != 0 {
+            return None;
+        }
+        self.code.extend_from_slice(&[
+            0x0F, 0x57, 0xC0, // xorps xmm0, xmm0
+            0x0F, 0x57, 0xC9, // xorps xmm1, xmm1
+        ]);
+        #[cfg(windows)]
+        self.code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x91]); // movsd xmm2, [rcx + disp32]
+        #[cfg(not(windows))]
+        self.code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x97]); // movsd xmm2, [rdi + disp32]
+        self.code.extend_from_slice(&0_i32.to_le_bytes());
+        self.code.extend_from_slice(&[
+            0x48, 0xB8, // mov rax, 1.0 bits
+        ]);
+        self.code
+            .extend_from_slice(&1.0_f64.to_bits().to_le_bytes());
+        self.code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xD8]); // movq xmm3, rax
+
+        let loop_start = self.code.len();
+        self.code.extend_from_slice(&[
+            0x66, 0x0F, 0x2E, 0xCA, // ucomisd xmm1, xmm2
+            0x0F, 0x8A, // jp exit (NaN limit)
+        ]);
+        let unordered_exit = self.emit_rel32_placeholder();
+        self.code.extend_from_slice(&[0x0F, 0x83]); // jae exit
+        let bound_exit = self.emit_rel32_placeholder();
+        self.code.extend_from_slice(&[
+            0xF2, 0x0F, 0x58, 0xC1, // addsd xmm0, xmm1
+            0xF2, 0x0F, 0x58, 0xCB, // addsd xmm1, xmm3
+            0xE9, // jmp loop
+        ]);
+        let backedge = self.emit_rel32_placeholder();
+        let exit = self.code.len();
+        self.patch_rel32(unordered_exit, exit)?;
+        self.patch_rel32(bound_exit, exit)?;
+        self.patch_rel32(backedge, loop_start)?;
+        self.code.extend_from_slice(&[
+            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0xF2, 0x0F, 0x11, 0x04, 0x24, // movsd [rsp], xmm0
+        ]);
+        self.stack_depth = 1;
+        Some(())
+    }
+
+    fn emit_comparison(
+        &mut self,
+        graph: &SeaOfNodes,
+        left: usize,
+        right: usize,
+        operation: Node,
+    ) -> Option<()> {
+        graph.emit_node(left, self)?;
+        graph.emit_node(right, self)?;
+        self.code.extend_from_slice(&[
+            0xF2, 0x0F, 0x10, 0x44, 0x24, 0x08, // movsd xmm0, [rsp + 8]
+            0x66, 0x0F, 0x2E, 0x04, 0x24, // ucomisd xmm0, [rsp]
+        ]);
+        match operation {
+            Node::LessThan(_, _) | Node::LessThanOrEqual(_, _) => {
+                let setcc = if matches!(operation, Node::LessThan(_, _)) {
+                    0x92
+                } else {
+                    0x96
+                };
+                self.code.extend_from_slice(&[
+                    0x0F, setcc, 0xC0, // setb/setbe al
+                    0x0F, 0x9B, 0xC2, // setnp dl
+                    0x20, 0xD0, // and al, dl
+                ]);
+            }
+            Node::GreaterThan(_, _) | Node::GreaterThanOrEqual(_, _) => {
+                let setcc = if matches!(operation, Node::GreaterThan(_, _)) {
+                    0x97
+                } else {
+                    0x93
+                };
+                self.code.extend_from_slice(&[0x0F, setcc, 0xC0]); // seta/setae al
+            }
+            Node::StrictEqual(_, _) => self.code.extend_from_slice(&[
+                0x0F, 0x94, 0xC0, // sete al
+                0x0F, 0x9B, 0xC2, // setnp dl
+                0x20, 0xD0, // and al, dl
+            ]),
+            Node::StrictNotEqual(_, _) => self.code.extend_from_slice(&[
+                0x0F, 0x95, 0xC0, // setne al
+                0x0F, 0x9A, 0xC2, // setp dl
+                0x08, 0xD0, // or al, dl
+            ]),
+            _ => return None,
+        }
+        self.code.extend_from_slice(&[
+            0x0F, 0xB6, 0xC0, // movzx eax, al
+            0xF2, 0x0F, 0x2A, 0xC0, // cvtsi2sd xmm0, eax
+            0x48, 0x83, 0xC4, 0x10, // add rsp, 16
+            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0xF2, 0x0F, 0x11, 0x04, 0x24, // movsd [rsp], xmm0
+        ]);
+        self.stack_depth -= 1;
+        Some(())
+    }
+
     fn emit_conditional(
         &mut self,
         graph: &SeaOfNodes,
@@ -743,7 +1190,9 @@ impl BaselineCompiler {
     }
 
     fn patch_rel32(&mut self, operand: usize, target: usize) -> Option<()> {
-        let displacement = i32::try_from(target.checked_sub(operand.checked_add(4)?)?).ok()?;
+        let target = i64::try_from(target).ok()?;
+        let next_instruction = i64::try_from(operand.checked_add(4)?).ok()?;
+        let displacement = i32::try_from(target - next_instruction).ok()?;
         self.code[operand..operand + 4].copy_from_slice(&displacement.to_le_bytes());
         Some(())
     }
@@ -818,9 +1267,42 @@ fn fold_binary(
     }
 }
 
+fn fold_comparison(
+    nodes: &[Node],
+    left: usize,
+    right: usize,
+    operation: fn(f64, f64) -> bool,
+) -> Option<Node> {
+    match (nodes.get(left)?, nodes.get(right)?) {
+        (Node::Constant(left), Node::Constant(right)) => {
+            let result: f64 = if operation(f64::from_bits(*left), f64::from_bits(*right)) {
+                1.0
+            } else {
+                0.0
+            };
+            Some(Node::Constant(result.to_bits()))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Engine, Value};
+
+    #[test]
+    fn counted_sum_pattern_is_recognized() {
+        let source = "function tierDynamicSum(limit) { let total = 0; for (let index = 0; index < limit; index++) { total = total + index; } return total; }";
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let crate::parser::Stmt::FunctionDeclaration {
+            parameters, body, ..
+        } = &program.statements[0]
+        else {
+            panic!("expected function declaration");
+        };
+        assert!(super::counted_sum_loop(parameters, body).is_some());
+    }
 
     #[test]
     fn native_jit_preserves_binary64_arithmetic() {

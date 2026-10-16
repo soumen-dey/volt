@@ -14,3 +14,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "volt"
 path = "src/main.rs"
+
+[[bench]]
+name = "runtime"
+harness = false
