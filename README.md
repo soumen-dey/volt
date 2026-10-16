@@ -65,6 +65,11 @@ The interpreter currently supports:
   expressions, and eager binary expressions, with function-table dispatch,
   guarded binding inline caches, and numeric operand type feedback; unsupported
   expression forms continue through the AST evaluator
+- a two-tier x86-64 native JIT for side-effect-free numeric expressions using
+  numeric literals and numeric bindings: a baseline template emitter runs on
+  first use, then the Turbovolt Sea-of-Nodes backend applies constant folding,
+  common-subexpression elimination, and an allocation-free IR check after
+  repeated execution
 - a persistent global environment across evaluations
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
@@ -90,6 +95,14 @@ string decoding, token storage, and AST construction still allocate.
 The bytecode VM is an initial expression-execution path, not a replacement for
 the AST evaluator. Its function-table dispatch is not a direct-threaded
 interpreter, and no comparative speedup is claimed.
+The JIT currently accepts numeric literals and numeric bindings, unary
+negation, and `+`, `-`, `*`, and `/` expressions on x86-64 Linux, macOS, and
+Windows where executable memory is permitted.
+Non-numeric bindings, other expressions, and other platforms continue through
+the VM/interpreter. The optimizing IR has no heap allocation nodes yet, so its
+allocation check does not constitute general object escape analysis; there is
+no JIT speedup claim. Tiering data and compiled code are scoped to one
+evaluation or function invocation.
 Some array methods,
 complete string/number behavior, RegExp literal parsing and the complete set of
 RegExp/String integration algorithms and edge cases, `Symbol`, `BigInt`, `Proxy`,

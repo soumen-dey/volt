@@ -1,3 +1,4 @@
+mod jit;
 mod lexer;
 mod parser;
 mod vm;
@@ -284,6 +285,7 @@ pub struct Engine {
     strict: bool,
     random_state: u64,
     bytecode_cache: Vec<HashMap<usize, vm::Bytecode>>,
+    jit_cache: Vec<jit::JitCache>,
 }
 
 impl Engine {
@@ -312,6 +314,7 @@ impl Engine {
             error_prototypes: HashMap::new(),
             strict: false,
             bytecode_cache: Vec::new(),
+            jit_cache: Vec::new(),
             random_state: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_nanos() as u64)
@@ -1366,9 +1369,11 @@ impl Engine {
         let tokens = Lexer::new(source).tokenize()?;
         let program = parser::Parser::new(tokens).parse_program()?;
         self.bytecode_cache.push(HashMap::new());
+        self.jit_cache.push(jit::JitCache::default());
         let previous_strict = self.strict;
         self.strict = program.strict;
         let execution = self.execute_statements(&program.statements, self.global);
+        self.jit_cache.pop();
         self.bytecode_cache.pop();
         self.strict = previous_strict;
         match execution? {
@@ -1784,6 +1789,31 @@ impl Engine {
 
     fn evaluate(&mut self, expression: &Expr, scope: ScopeId) -> Result<Value, EngineError> {
         let expression_key = expression as *const Expr as usize;
+        let jit_variables = self
+            .jit_cache
+            .last_mut()
+            .and_then(|cache| cache.prepare(expression_key, expression));
+        if let Some(variables) = jit_variables {
+            let mut inputs = Vec::with_capacity(variables.len());
+            let mut is_numeric = true;
+            for name in variables {
+                match self.get_binding(scope, &name, 1, 1) {
+                    Ok(Some(Value::Number(value))) => inputs.push(value),
+                    Ok(_) | Err(_) => {
+                        is_numeric = false;
+                        break;
+                    }
+                }
+            }
+            if is_numeric
+                && let Some(value) = self
+                    .jit_cache
+                    .last_mut()
+                    .and_then(|cache| cache.run(expression_key, expression, &inputs))
+            {
+                return Ok(value);
+            }
+        }
         let bytecode = self.bytecode_cache.last_mut().and_then(|cache| {
             cache
                 .remove(&expression_key)
@@ -3031,7 +3061,9 @@ impl Engine {
                 let previous_strict = self.strict;
                 self.strict = strict;
                 self.bytecode_cache.push(HashMap::new());
+                self.jit_cache.push(jit::JitCache::default());
                 let result = self.execute_statements(&body, function_scope);
+                self.jit_cache.pop();
                 self.bytecode_cache.pop();
                 self.strict = previous_strict;
                 match result? {

@@ -241,7 +241,7 @@ impl<'a> Lexer<'a> {
             "!=", "<=", ">=", "&&", "||", "??", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=",
             "|=", "^=", "<<", ">>",
         ];
-        const OTHER: [&str; 10] = ["=", "<", ">", "!", "+", "-", "*", "&", "|", "?"];
+        const OTHER: [&str; 12] = ["=", "<", ">", "!", "+", "-", "*", "/", "%", "&", "|", "?"];
         let start = self.offset;
         for operator in OPERATORS.iter().chain(OTHER.iter()) {
             if self.source[self.offset..].starts_with(operator) {
