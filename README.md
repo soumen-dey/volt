@@ -1,4 +1,4 @@
-# js-engine
+# Volt
 
 A from-scratch JavaScript interpreter written in Rust. The project owns its
 tokenizer, parser, runtime values, scopes, and evaluator; it does not embed
@@ -103,10 +103,25 @@ Files passed together execute in order in one persistent global environment.
 The CLI prints the completion value of each file or evaluation. The `--module`
 option is reserved but modules are not implemented.
 
+## Install the CLI
+
+On Linux or macOS with an x86_64 or arm64 CPU, install the latest release with:
+
+```sh
+curl -fsSL https://soumendey.com/volt/install | sh
+```
+
+The installer verifies the downloaded release archive against its published
+SHA-256 checksum and installs the `volt` executable to `~/.local/bin`.
+Add that directory to `PATH` if it is not already there. To install a specific
+release, set `VOLT_VERSION` (for example, `VOLT_VERSION=v0.1.0`).
+Set `VOLT_INSTALL_DIR` to choose another install directory. Windows and
+other platform/architecture combinations are not supported by this installer.
+
 ## Embed
 
 ```rust
-use js_engine::Engine;
+use volt_engine::Engine;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::new();

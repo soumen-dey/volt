@@ -10,7 +10,7 @@ fn main() {
 
     match first.as_deref() {
         Some("--help") | Some("-h") => print_help(),
-        Some("--version") | Some("-V") => println!("js-engine {}", env!("CARGO_PKG_VERSION")),
+        Some("--version") | Some("-V") => println!("Volt {}", env!("CARGO_PKG_VERSION")),
         Some("-e") | Some("--eval") => {
             let source = args.collect::<Vec<_>>().join(" ");
             if source.is_empty() {
@@ -25,11 +25,11 @@ fn main() {
         }
         Some(arg) if arg.starts_with('-') => {
             eprintln!("Unknown option: {arg}");
-            eprintln!("Run 'js-engine --help' for usage.");
+            eprintln!("Run 'volt --help' for usage.");
             process::exit(2);
         }
         Some(path) => {
-            let mut engine = js_engine::Engine::new();
+            let mut engine = volt_engine::Engine::new();
             if let Err(error) = evaluate_file(&mut engine, path) {
                 eprintln!("{error}");
                 process::exit(1);
@@ -46,7 +46,7 @@ fn main() {
 }
 
 fn evaluate_source(source: &str, name: &str) {
-    let mut engine = js_engine::Engine::new();
+    let mut engine = volt_engine::Engine::new();
     match engine.eval_to_string(source) {
         Ok(value) => {
             println!("{value}");
@@ -67,7 +67,7 @@ fn evaluate_stdin() {
     evaluate_source(&source, "<stdin>");
 }
 
-fn evaluate_file(engine: &mut js_engine::Engine, path: &str) -> Result<(), String> {
+fn evaluate_file(engine: &mut volt_engine::Engine, path: &str) -> Result<(), String> {
     let source = fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
     let value = engine
         .eval_to_string(&source)
@@ -78,13 +78,13 @@ fn evaluate_file(engine: &mut js_engine::Engine, path: &str) -> Result<(), Strin
 
 fn print_help() {
     println!(
-        "js-engine {}\n\
+        "Volt {}\n\
          Headless ECMAScript runtime CLI\n\n\
          Usage:\n\
-           js-engine [OPTIONS] [FILE...]\n\
-           js-engine --eval <SOURCE>\n\
-           js-engine --module <FILE...>  (not implemented yet)\n\
-           js-engine < script.js\n\n\
+           volt [OPTIONS] [FILE...]\n\
+           volt --eval <SOURCE>\n\
+           volt --module <FILE...>  (not implemented yet)\n\
+           volt < script.js\n\n\
          Options:\n\
            -e, --eval <SOURCE>  Evaluate JavaScript source\n\
            -m, --module <FILE>  Evaluate module file(s) with imports\n\

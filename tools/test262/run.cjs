@@ -28,7 +28,7 @@ async function main() {
     );
   }
   const enginePath = path.resolve(
-    args.engine || path.join(root, "target", "debug", `js-engine${process.platform === "win32" ? ".exe" : ""}`),
+    args.engine || path.join(root, "target", "debug", `volt${process.platform === "win32" ? ".exe" : ""}`),
   );
   if (!fs.existsSync(path.join(test262Dir, "test"))) {
     throw new Error(`Test262 checkout not found: ${test262Dir}`);
@@ -81,7 +81,7 @@ async function main() {
     test262Revision: revision,
     pinnedRevision,
     pinMatched: revision === pinnedRevision,
-    engine: "soumen-dey/rust-javascript-engine (from-scratch Rust interpreter)",
+    engine: "soumen-dey/volt (from-scratch Rust interpreter)",
     selection: paths,
     scenarios: cases,
     ...counts,

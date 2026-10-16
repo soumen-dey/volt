@@ -1,5 +1,5 @@
 [package]
-name = "js-engine"
+name = "volt-engine"
 version = "0.1.0"
 edition = "2024"
 description = "A from-scratch headless JavaScript interpreter in Rust"
@@ -8,9 +8,9 @@ description = "A from-scratch headless JavaScript interpreter in Rust"
 regress = { version = "0.12", features = ["utf16"] }
 
 [lib]
-name = "js_engine"
+name = "volt_engine"
 path = "src/lib.rs"
 
 [[bin]]
-name = "js-engine"
+name = "volt"
 path = "src/main.rs"
