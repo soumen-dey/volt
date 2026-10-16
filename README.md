@@ -70,6 +70,10 @@ The interpreter currently supports:
   first use, then the Turbovolt Sea-of-Nodes backend applies constant folding,
   common-subexpression elimination, and an allocation-free IR check after
   repeated execution
+- a tracing generational object collector with arena-slot reuse, a young-object
+  nursery, survivor promotion, closure/property/collection tracing, weak
+  collection cleanup, automatic minor collections, and an explicit full
+  collection API
 - a persistent global environment across evaluations
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
@@ -87,14 +91,23 @@ basic additions and deletions, but the full collection API is not complete.
 The `Date` parser accepts a limited ISO date/time form; local-time methods are
 UTC aliases in this headless runtime, and the complete ECMAScript date-string
 grammar is not implemented.
-`WeakMap` and `WeakSet` enforce object-key requirements but do not provide
-garbage-collection weak-reference behavior because the runtime has no garbage
-collector.
+`WeakMap` and `WeakSet` enforce object-key requirements and discard entries
+whose keys are no longer reachable during collection; finalizers and
+specification-complete weak-reference behavior are not implemented.
 SIMD scanning currently accelerates ASCII identifier runs and spaces/tabs;
 string decoding, token storage, and AST construction still allocate.
 The bytecode VM is an initial expression-execution path, not a replacement for
 the AST evaluator. Its function-table dispatch is not a direct-threaded
 interpreter, and no comparative speedup is claimed.
+The collector allocates object handles from a stable arena, reuses reclaimed
+slots, and performs minor collections after 256 object allocations. Survivors
+are promoted; a full collection runs every eight minor collections or when
+`Engine::collect_garbage` is called. Collections occur at evaluation
+boundaries, not in the middle of script execution. The collector is currently
+stop-the-world and single-threaded; pause duration depends on the reachable
+heap and is not guaranteed to stay below 150 μs. Values returned to the host
+are conservatively retained as roots for the lifetime of the engine because
+the API has no explicit host-root release handle.
 The JIT currently accepts numeric literals and numeric bindings, unary
 negation, and `+`, `-`, `*`, and `/` expressions on x86-64 Linux, macOS, and
 Windows where executable memory is permitted.
@@ -112,10 +125,10 @@ complete ECMAScript error objects are also missing. The parser and runtime
 semantics remain a limited subset; passing the focused Rust tests does not
 establish general ECMAScript conformance. Unsupported syntax reports a
 `SyntaxError`. Object and scope storage is engine-owned and reclaimed
-when the engine is dropped; there is no garbage collector yet, so long-running
-engines retain allocations made by evaluated scripts. This implementation must
-not be used to execute untrusted or unbounded scripts; it does not yet enforce
-time, memory, or recursion limits.
+when the engine is dropped; long-running scripts can still retain reachable
+objects, and execution time, memory, and recursion limits are not enforced.
+This implementation must not be used to execute untrusted or unbounded
+scripts.
 
 ## Run
 
@@ -169,8 +182,8 @@ The intended sequence is to grow the own implementation incrementally:
    constructor, and exception semantics.
 2. Add arrays and the standard built-ins systematically.
 3. Implement promise jobs and modules.
-4. Replace engine-lifetime arena retention with a tracing garbage collector;
-   add safe embedding/resource controls.
+4. Add concurrent marking, bounded pause-time strategies, and safe
+   embedding/resource controls to the initial stop-the-world collector.
 5. Make the Test262 harness work with the owned runtime and measure progress
    against a pinned suite revision; only then expand toward ES2020.
 

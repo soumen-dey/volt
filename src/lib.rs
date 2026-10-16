@@ -6,13 +6,40 @@ mod vm;
 use lexer::Lexer;
 use parser::{BinaryOp, DeclarationKind, Expr, Stmt, UnaryOp};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 type ObjectId = usize;
 type ScopeId = usize;
+
+const NURSERY_ALLOCATION_LIMIT: usize = 256;
+const MAJOR_COLLECTION_INTERVAL: usize = 8;
+
+fn mark_object(object: ObjectId, marked: &mut [bool], queue: &mut VecDeque<ObjectId>) {
+    if let Some(is_marked) = marked.get_mut(object)
+        && !*is_marked
+    {
+        *is_marked = true;
+        queue.push_back(object);
+    }
+}
+
+fn mark_scope(scope: ScopeId, marked: &mut [bool], queue: &mut VecDeque<ScopeId>) {
+    if let Some(is_marked) = marked.get_mut(scope)
+        && !*is_marked
+    {
+        *is_marked = true;
+        queue.push_back(scope);
+    }
+}
+
+fn mark_value(value: &Value, marked: &mut [bool], queue: &mut VecDeque<ObjectId>) {
+    if let Value::Object(object) = value {
+        mark_object(*object, marked, queue);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
@@ -262,11 +289,19 @@ enum Reference {
 
 /// A from-scratch, headless JavaScript interpreter for the subset listed in
 /// the README. Objects and lexical environments are held in engine-owned
-/// arenas and are reclaimed when the engine is dropped.
+/// arenas. Unreachable objects are reclaimed at allocation safepoints or by
+/// calling [`Engine::collect_garbage`].
 pub struct Engine {
     global: ScopeId,
     scopes: Vec<Scope>,
     objects: Vec<Object>,
+    object_ages: Vec<u8>,
+    object_live: Vec<bool>,
+    free_objects: Vec<ObjectId>,
+    free_scopes: Vec<ScopeId>,
+    external_object_roots: HashSet<ObjectId>,
+    nursery_allocations: usize,
+    minor_collections: usize,
     object_prototype: ObjectId,
     global_object: ObjectId,
     array_prototype: ObjectId,
@@ -297,6 +332,13 @@ impl Engine {
                 ..Scope::default()
             }],
             objects: Vec::new(),
+            object_ages: Vec::new(),
+            object_live: Vec::new(),
+            free_objects: Vec::new(),
+            free_scopes: Vec::new(),
+            external_object_roots: HashSet::new(),
+            nursery_allocations: 0,
+            minor_collections: 0,
             object_prototype: 0,
             global_object: 0,
             array_prototype: 0,
@@ -1075,13 +1117,202 @@ impl Engine {
     }
 
     fn alloc_object(&mut self, prototype: Option<ObjectId>) -> ObjectId {
-        let id = self.objects.len();
-        self.objects.push(Object {
+        let object = Object {
             prototype,
             extensible: true,
             ..Object::default()
-        });
+        };
+        let id = if let Some(id) = self.free_objects.pop() {
+            self.objects[id] = object;
+            self.object_ages[id] = 0;
+            self.object_live[id] = true;
+            id
+        } else {
+            let id = self.objects.len();
+            self.objects.push(object);
+            self.object_ages.push(0);
+            self.object_live.push(true);
+            id
+        };
+        self.nursery_allocations = self.nursery_allocations.saturating_add(1);
         id
+    }
+
+    /// Performs a full tracing collection and returns the number of reclaimed
+    /// object slots.
+    pub fn collect_garbage(&mut self) -> usize {
+        self.collect_objects(true)
+    }
+
+    fn collect_objects(&mut self, full: bool) -> usize {
+        let mut marked = vec![false; self.objects.len()];
+        let mut marked_scopes = vec![false; self.scopes.len()];
+        let mut object_queue = VecDeque::new();
+        let mut scope_queue = VecDeque::new();
+
+        for object in [
+            self.object_prototype,
+            self.global_object,
+            self.array_prototype,
+            self.array_iterator_prototype,
+            self.collection_iterator_prototype,
+            self.map_prototype,
+            self.set_prototype,
+            self.weak_map_prototype,
+            self.weak_set_prototype,
+            self.date_prototype,
+            self.regexp_prototype,
+            self.string_prototype,
+            self.number_prototype,
+            self.boolean_prototype,
+        ]
+        .into_iter()
+        .chain(self.error_prototypes.values().copied())
+        .chain(self.external_object_roots.iter().copied())
+        {
+            mark_object(object, &mut marked, &mut object_queue);
+        }
+        mark_scope(self.global, &mut marked_scopes, &mut scope_queue);
+        self.trace_gc_references(
+            &mut marked,
+            &mut marked_scopes,
+            &mut object_queue,
+            &mut scope_queue,
+        );
+
+        loop {
+            let previously_marked = marked.iter().filter(|is_marked| **is_marked).count();
+            for (id, object) in self.objects.iter().enumerate() {
+                if !marked[id] {
+                    continue;
+                }
+                if let Some(entries) = &object.weak_map_data {
+                    for (key, value) in entries {
+                        if marked.get(*key).copied().unwrap_or(false) {
+                            mark_value(value, &mut marked, &mut object_queue);
+                        }
+                    }
+                }
+            }
+            self.trace_gc_references(
+                &mut marked,
+                &mut marked_scopes,
+                &mut object_queue,
+                &mut scope_queue,
+            );
+            if marked.iter().filter(|is_marked| **is_marked).count() == previously_marked {
+                break;
+            }
+        }
+
+        for (id, object) in self.objects.iter_mut().enumerate() {
+            if !self.object_live[id] || !marked[id] {
+                continue;
+            }
+            if let Some(entries) = &mut object.weak_map_data {
+                entries.retain(|(key, _)| marked.get(*key).copied().unwrap_or(false));
+            }
+            if let Some(entries) = &mut object.weak_set_data {
+                entries.retain(|key| marked.get(*key).copied().unwrap_or(false));
+            }
+        }
+
+        let mut reclaimed = 0;
+        for (id, &is_marked) in marked.iter().enumerate() {
+            if self.object_live[id] && !is_marked && (full || self.object_ages[id] == 0) {
+                self.objects[id] = Object::default();
+                self.object_ages[id] = 0;
+                self.object_live[id] = false;
+                self.free_objects.push(id);
+                reclaimed += 1;
+            } else if self.object_live[id] && is_marked && self.object_ages[id] == 0 {
+                self.object_ages[id] = 1;
+            }
+        }
+        for (id, &is_marked) in marked_scopes.iter().enumerate() {
+            if id != self.global
+                && !is_marked
+                && (self.scopes[id].parent.is_some()
+                    || !self.scopes[id].bindings.is_empty()
+                    || self.scopes[id].var_scope)
+            {
+                self.scopes[id] = Scope::default();
+                self.free_scopes.push(id);
+            }
+        }
+        self.nursery_allocations = 0;
+        if full {
+            self.minor_collections = 0;
+        } else {
+            self.minor_collections = self.minor_collections.saturating_add(1);
+        }
+        reclaimed
+    }
+
+    fn trace_gc_references(
+        &self,
+        marked: &mut [bool],
+        marked_scopes: &mut [bool],
+        object_queue: &mut VecDeque<ObjectId>,
+        scope_queue: &mut VecDeque<ScopeId>,
+    ) {
+        while !object_queue.is_empty() || !scope_queue.is_empty() {
+            while let Some(scope_id) = scope_queue.pop_front() {
+                let Some(scope) = self.scopes.get(scope_id) else {
+                    continue;
+                };
+                if let Some(parent) = scope.parent {
+                    mark_scope(parent, marked_scopes, scope_queue);
+                }
+                for binding in scope.bindings.values() {
+                    mark_value(&binding.value, marked, object_queue);
+                }
+            }
+            while let Some(object_id) = object_queue.pop_front() {
+                let Some(object) = self.objects.get(object_id) else {
+                    continue;
+                };
+                if let Some(prototype) = object.prototype {
+                    mark_object(prototype, marked, object_queue);
+                }
+                for value in object.properties.values() {
+                    mark_value(value, marked, object_queue);
+                }
+                for attributes in object.property_attributes.values() {
+                    if let PropertyKind::Accessor { getter, setter } = &attributes.kind {
+                        if let Some(value) = getter {
+                            mark_value(value, marked, object_queue);
+                        }
+                        if let Some(value) = setter {
+                            mark_value(value, marked, object_queue);
+                        }
+                    }
+                }
+                for (scope, _) in object.parameter_map.values() {
+                    mark_scope(*scope, marked_scopes, scope_queue);
+                }
+                if let Some(Function::User { closure, .. }) = &object.function {
+                    mark_scope(*closure, marked_scopes, scope_queue);
+                }
+                if let Some(iterator) = &object.array_iterator {
+                    mark_object(iterator.array, marked, object_queue);
+                }
+                if let Some(iterator) = &object.collection_iterator {
+                    mark_object(iterator.collection, marked, object_queue);
+                }
+                if let Some(entries) = &object.map_data {
+                    for entry in entries.iter().flatten() {
+                        mark_value(&entry.0, marked, object_queue);
+                        mark_value(&entry.1, marked, object_queue);
+                    }
+                }
+                if let Some(values) = &object.set_data {
+                    for value in values.iter().flatten() {
+                        mark_value(value, marked, object_queue);
+                    }
+                }
+            }
+        }
     }
 
     fn alloc_array(&mut self) -> ObjectId {
@@ -1160,13 +1391,19 @@ impl Engine {
     }
 
     fn new_scope(&mut self, parent: ScopeId) -> ScopeId {
-        let id = self.scopes.len();
-        self.scopes.push(Scope {
+        let scope = Scope {
             bindings: HashMap::new(),
             parent: Some(parent),
             var_scope: false,
-        });
-        id
+        };
+        if let Some(id) = self.free_scopes.pop() {
+            self.scopes[id] = scope;
+            id
+        } else {
+            let id = self.scopes.len();
+            self.scopes.push(scope);
+            id
+        }
     }
 
     fn new_function_scope(&mut self, parent: ScopeId) -> ScopeId {
@@ -1376,21 +1613,35 @@ impl Engine {
         self.jit_cache.pop();
         self.bytecode_cache.pop();
         self.strict = previous_strict;
-        match execution? {
-            Completion::Normal(value) => Ok(value),
-            Completion::Return(_) => Err(EngineError::new(
+        let result = match execution {
+            Err(error) => Err(error),
+            Ok(Completion::Normal(value)) => Ok(value),
+            Ok(Completion::Return(_)) => Err(EngineError::new(
                 "SyntaxError",
                 "Return statement outside function",
                 1,
                 1,
             )),
-            Completion::Break | Completion::Continue => Err(EngineError::new(
+            Ok(Completion::Break | Completion::Continue) => Err(EngineError::new(
                 "SyntaxError",
                 "Invalid loop control statement",
                 1,
                 1,
             )),
+        };
+        if let Ok(Value::Object(object)) = &result {
+            self.external_object_roots.insert(*object);
         }
+        if let Err(error) = &result
+            && let Some(Value::Object(object)) = &error.thrown
+        {
+            self.external_object_roots.insert(*object);
+        }
+        if self.nursery_allocations >= NURSERY_ALLOCATION_LIMIT {
+            let major = self.minor_collections + 1 >= MAJOR_COLLECTION_INTERVAL;
+            self.collect_objects(major);
+        }
+        result
     }
 
     pub fn eval_to_string(&mut self, source: &str) -> Result<String, EngineError> {
@@ -7325,6 +7576,41 @@ mod tests {
             "42"
         );
         assert_eq!(engine.eval_to_string("answer + 1").unwrap(), "43");
+    }
+
+    #[test]
+    fn garbage_collector_reclaims_unreachable_objects_and_preserves_closures() {
+        let mut engine = Engine::new();
+        engine.eval("0").unwrap();
+        engine
+            .eval("let gcGarbage = {}; gcGarbage = null; 0")
+            .unwrap();
+        assert!(engine.collect_garbage() > 0);
+
+        engine.eval("let gcKept = { value: 41 }").unwrap();
+        assert_eq!(engine.eval("gcKept.value").unwrap(), Value::Number(41.0));
+        assert_eq!(engine.eval("gcKept.value").unwrap(), Value::Number(41.0));
+        engine
+            .eval("function gcRead() { return gcKept.value; }")
+            .unwrap();
+        assert_eq!(engine.eval("gcRead()").unwrap(), Value::Number(41.0));
+        engine.collect_garbage();
+        assert_eq!(engine.eval("gcRead()").unwrap(), Value::Number(41.0));
+    }
+
+    #[test]
+    fn garbage_collector_clears_dead_weak_collection_entries() {
+        let mut engine = Engine::new();
+        engine
+            .eval(
+                "let gcWeakKey = {}; let gcWeak = new WeakMap(); gcWeak.set(gcWeakKey, 1); gcWeakKey = null;",
+            )
+            .unwrap();
+        engine.collect_garbage();
+        assert_eq!(
+            engine.eval("gcWeak.has(gcWeakKey)").unwrap(),
+            Value::Boolean(false)
+        );
     }
 
     #[test]
