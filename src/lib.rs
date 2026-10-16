@@ -1713,6 +1713,9 @@ impl Engine {
         scope: ScopeId,
     ) -> Result<Completion, EngineError> {
         self.instantiate_declarations(statements, scope)?;
+        if let Some(mut bytecode) = vm::Bytecode::compile_statements(statements) {
+            return bytecode.run(self, scope).map(Completion::Normal);
+        }
         let mut result = Value::Undefined;
         for statement in statements {
             match self.execute_statement(statement, scope)? {
@@ -3313,7 +3316,21 @@ impl Engine {
                 self.strict = strict;
                 self.bytecode_cache.push(HashMap::new());
                 self.jit_cache.push(jit::JitCache::default());
-                let result = self.execute_statements(&body, function_scope);
+                let result = if let Some(mut bytecode) = vm::Bytecode::compile_function(&body) {
+                    match self.instantiate_declarations(&body, function_scope) {
+                        Err(error) => Err(error),
+                        Ok(()) => {
+                            bytecode
+                                .run_function(self, function_scope)
+                                .map(|flow| match flow {
+                                    vm::Flow::Complete(value) => Completion::Normal(value),
+                                    vm::Flow::Return(value) => Completion::Return(value),
+                                })
+                        }
+                    }
+                } else {
+                    self.execute_statements(&body, function_scope)
+                };
                 self.jit_cache.pop();
                 self.bytecode_cache.pop();
                 self.strict = previous_strict;
@@ -7488,6 +7505,82 @@ impl vm::Host for Engine {
             }
         }
         self.evaluate_binary(operator, left, right)
+    }
+
+    fn check_binding_assignment(
+        &self,
+        scope: usize,
+        name: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<(), EngineError> {
+        let Some(binding_scope) = self.find_binding_scope(scope, name) else {
+            if self.strict {
+                return Err(EngineError::new(
+                    "ReferenceError",
+                    format!("{name} is not defined"),
+                    line,
+                    column,
+                ));
+            }
+            return Ok(());
+        };
+        let binding = &self.scopes[binding_scope].bindings[name];
+        if !binding.initialized {
+            return Err(EngineError::new(
+                "ReferenceError",
+                format!("Cannot access '{name}' before initialization"),
+                line,
+                column,
+            ));
+        }
+        if !binding.mutable {
+            return Err(EngineError::new(
+                "TypeError",
+                format!("Assignment to constant variable '{name}'"),
+                line,
+                column,
+            ));
+        }
+        Ok(())
+    }
+
+    fn store_binding(
+        &mut self,
+        scope: usize,
+        name: &str,
+        value: Value,
+        line: usize,
+        column: usize,
+    ) -> Result<Value, EngineError> {
+        self.assign_binding(scope, name, value, line, column)
+    }
+
+    fn initialize_declaration(
+        &mut self,
+        scope: usize,
+        name: &str,
+        value: Value,
+        kind: DeclarationKind,
+    ) -> Result<(), EngineError> {
+        let scope = if kind == DeclarationKind::Var {
+            self.var_scope(scope)
+        } else {
+            scope
+        };
+        if !self.scopes[scope].bindings.contains_key(name) {
+            return Err(EngineError::new(
+                "InternalError",
+                "Bytecode declaration was not instantiated",
+                1,
+                1,
+            ));
+        }
+        self.initialize_binding(scope, name, value.clone());
+        if kind == DeclarationKind::Var && scope == self.global {
+            self.set_property(self.global_object, name, value);
+        }
+        Ok(())
     }
 }
 

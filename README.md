@@ -61,10 +61,11 @@ The interpreter currently supports:
   identifier runs and horizontal whitespace, with a portable scalar fallback;
   identifier and operator token text borrows the source instead of allocating
   per token
-- a compact 16-bit-word bytecode VM for literals, binding reads, unary
-  expressions, and eager binary expressions, with function-table dispatch,
-  guarded binding inline caches, and numeric operand type feedback; unsupported
-  expression forms continue through the AST evaluator
+- a compact 16-bit-word bytecode VM for literals, binding reads/writes, unary
+  and binary expressions, short-circuit/conditional branches, and a subset of
+  statement control flow (`if`, `while`, and classic `for`); it has function-
+  table dispatch, guarded binding inline caches, and numeric operand type
+  feedback, while unsupported forms continue through the AST evaluator
 - a two-tier x86-64 native JIT for side-effect-free numeric expressions using
   numeric literals and numeric bindings: a baseline template emitter runs on
   first use, then the Turbovolt Sea-of-Nodes backend applies constant folding,
@@ -96,9 +97,15 @@ whose keys are no longer reachable during collection; finalizers and
 specification-complete weak-reference behavior are not implemented.
 SIMD scanning currently accelerates ASCII identifier runs and spaces/tabs;
 string decoding, token storage, and AST construction still allocate.
-The bytecode VM is an initial expression-execution path, not a replacement for
-the AST evaluator. Its function-table dispatch is not a direct-threaded
-interpreter, and no comparative speedup is claimed.
+The bytecode VM is an initial execution path, not a replacement for the AST
+evaluator. Its supported statements include `if`, `while`, and classic `for`,
+with `break` and `continue`; lexical declarations in nested blocks, `do...while`,
+`for...of`, and exceptions fall back to the AST evaluator. User-function
+invocation now executes supported bodies in VM frames, including parameters,
+closure binding reads, loop control, and returns. Unsupported bodies fall back
+as a whole to the AST evaluator; bytecode is currently compiled per invocation.
+Its function-table dispatch is not a direct-threaded interpreter, and no
+comparative speedup is claimed.
 The collector allocates object handles from a stable arena, reuses reclaimed
 slots, and performs minor collections after 256 object allocations. Survivors
 are promoted; a full collection runs every eight minor collections or when
