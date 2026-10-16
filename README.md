@@ -72,8 +72,8 @@ The interpreter currently supports:
 - a two-tier x86-64 native JIT for side-effect-free numeric expressions using
   numeric literals and numeric bindings: a baseline template emitter runs on
   first use, then the Turbovolt Sea-of-Nodes backend applies constant folding,
-  common-subexpression elimination, and an allocation-free IR check after
-  repeated execution
+  common-subexpression elimination, numeric conditional control flow, and an
+  allocation-free IR check after repeated execution
 - a tracing generational object collector with arena-slot reuse, a young-object
   nursery, survivor promotion, closure/property/collection tracing, weak
   collection cleanup, automatic minor collections, and an explicit full
@@ -111,11 +111,14 @@ bytecode loop backedges, and numeric/generic operand type feedback from VM
 execution. Bytecode is still compiled per invocation; this tier is not native
 code generation by itself. A hot function with one return expression made
 only of numeric literals, numeric local/parameter/closure bindings, unary
-negation, and `+`, `-`, `*`, or `/` can additionally run in the x86-64 baseline
-JIT. Only non-global bindings are eligible. It guards every binding as numeric
-on each call and falls back to VM or AST execution when a guard fails. Other
-function bodies remain interpreted or in VM bytecode. Dispatch is function-
-table based, not direct-threaded, and no comparative speedup is claimed.
+negation, `+`, `-`, `*`, `/`, or numeric conditional expressions can
+additionally run in the x86-64 native tier. Simple arithmetic uses the
+baseline emitter; numeric conditionals use the optimizing graph, which emits
+explicit branch/merge control flow. Only non-global bindings are eligible. It
+guards every binding as numeric on each call and falls back to VM or AST
+execution when a guard fails. Other function bodies remain interpreted or in
+VM bytecode. Dispatch is function-table based, not direct-threaded, and no
+comparative speedup is claimed.
 The collector allocates object handles from a stable arena, reuses reclaimed
 slots, and performs minor collections after 256 object allocations. Survivors
 are promoted; a full collection runs every eight minor collections or when
@@ -126,13 +129,16 @@ heap and is not guaranteed to stay below 150 μs. Values returned to the host
 are conservatively retained as roots for the lifetime of the engine because
 the API has no explicit host-root release handle.
 The native JIT accepts numeric literals and non-global numeric bindings,
-unary negation, and `+`, `-`, `*`, and `/` expressions on x86-64 Linux, macOS,
-and Windows where executable memory is permitted. Hot user functions can use
-this emitter for a single return expression; numeric guards send non-numeric
-inputs back to the VM/interpreter. Other expressions and platforms continue
-through the VM/interpreter. The optimizing IR has no heap allocation nodes yet, so its
-allocation check does not constitute general object escape analysis; there is
-no JIT speedup claim. Native expression-JIT data remains scoped to an
+unary negation, `+`, `-`, `*`, `/`, and numeric conditional expressions on
+x86-64 Linux, macOS, and Windows where executable memory is permitted. Hot
+user functions can use this emitter for a single return expression; numeric
+guards send non-numeric inputs back to the VM/interpreter. Other expressions
+and platforms continue through the VM/interpreter. The optimizing graph now
+supports numeric conditional control flow, but it is not a general SSA/Sea-of-
+Nodes compiler: loops, deoptimization state reconstruction, heap allocation
+nodes, and general escape analysis are not implemented. The allocation check
+only verifies that supported graph nodes are numeric and allocation-free.
+There is no JIT speedup claim. Native expression-JIT data remains scoped to an
 evaluation or function invocation; per-function VM tiering profiles and
 compiled baseline function code persist with their function objects.
 Some array methods,

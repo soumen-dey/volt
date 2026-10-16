@@ -12,14 +12,33 @@ pub(crate) struct JitCache {
 pub(crate) struct FunctionJit {
     variables: Vec<String>,
     baseline: NativeCode,
+    tier: FunctionJitTier,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FunctionJitTier {
+    Baseline,
+    Optimizing,
 }
 
 impl FunctionJit {
     pub(crate) fn compile(expression: &Expr) -> Option<Self> {
-        let (code, variables) = BaselineCompiler::compile(expression)?;
+        if let Some((code, variables)) = BaselineCompiler::compile(expression)
+            && let Some(baseline) = NativeCode::compile(&code)
+        {
+            return Some(Self {
+                variables,
+                baseline,
+                tier: FunctionJitTier::Baseline,
+            });
+        }
+        let variables = collect_numeric_variables(expression)?;
+        let graph = SeaOfNodes::compile(expression, &variables)?.optimize()?;
+        let baseline = NativeCode::compile(&graph.emit()?)?;
         Some(Self {
             variables,
-            baseline: NativeCode::compile(&code)?,
+            baseline,
+            tier: FunctionJitTier::Optimizing,
         })
     }
 
@@ -29,6 +48,10 @@ impl FunctionJit {
 
     pub(crate) fn run(&self, inputs: &[f64]) -> f64 {
         self.baseline.call(inputs)
+    }
+
+    pub(crate) fn tier(&self) -> FunctionJitTier {
+        self.tier
     }
 }
 
@@ -398,6 +421,7 @@ enum Node {
     Divide(usize, usize),
     Negate(usize),
     Variable(usize),
+    Conditional(usize, usize, usize),
 }
 
 struct SeaOfNodes {
@@ -460,6 +484,15 @@ impl SeaOfNodes {
                     _ => return None,
                 }
             }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => Node::Conditional(
+                self.expression(test, variable_slots)?,
+                self.expression(consequent, variable_slots)?,
+                self.expression(alternate, variable_slots)?,
+            ),
             _ => return None,
         };
         let index = self.nodes.len();
@@ -504,6 +537,18 @@ impl SeaOfNodes {
                     Node::Constant(bits) => Node::Constant((-f64::from_bits(bits)).to_bits()),
                     _ => Node::Negate(replacements[value]),
                 },
+                Node::Conditional(test, consequent, alternate) => {
+                    let test = replacements[test];
+                    let consequent = replacements[consequent];
+                    let alternate = replacements[alternate];
+                    match optimized[test] {
+                        Node::Constant(bits) if f64::from_bits(bits) == 0.0 => optimized[alternate],
+                        Node::Constant(bits) if !f64::from_bits(bits).is_nan() => {
+                            optimized[consequent]
+                        }
+                        _ => Node::Conditional(test, consequent, alternate),
+                    }
+                }
                 constant => constant,
             };
 
@@ -536,6 +581,7 @@ impl SeaOfNodes {
                     | Node::Multiply(_, _)
                     | Node::Divide(_, _)
                     | Node::Negate(_)
+                    | Node::Conditional(_, _, _)
                     | Node::Variable(_)
             )
         })
@@ -573,11 +619,107 @@ impl SeaOfNodes {
                 Some(())
             }
             Node::Variable(slot) => compiler.push_variable(slot),
+            Node::Conditional(test, consequent, alternate) => {
+                compiler.emit_conditional(self, test, consequent, alternate)
+            }
         }
     }
 }
 
+fn collect_numeric_variables(expression: &Expr) -> Option<Vec<String>> {
+    fn collect(expression: &Expr, variables: &mut Vec<String>) -> Option<()> {
+        match expression {
+            Expr::Literal(Value::Number(_)) => Some(()),
+            Expr::Identifier { name, .. } => {
+                if !variables.contains(name) {
+                    variables.push(name.clone());
+                }
+                Some(())
+            }
+            Expr::Unary {
+                operator: crate::parser::UnaryOp::Minus,
+                operand,
+                ..
+            } => collect(operand, variables),
+            Expr::Binary {
+                operator:
+                    crate::parser::BinaryOp::Add
+                    | crate::parser::BinaryOp::Subtract
+                    | crate::parser::BinaryOp::Multiply
+                    | crate::parser::BinaryOp::Divide,
+                left,
+                right,
+            } => {
+                collect(left, variables)?;
+                collect(right, variables)
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                collect(test, variables)?;
+                collect(consequent, variables)?;
+                collect(alternate, variables)
+            }
+            _ => None,
+        }
+    }
+
+    let mut variables = Vec::new();
+    collect(expression, &mut variables)?;
+    Some(variables)
+}
+
 impl BaselineCompiler {
+    fn emit_conditional(
+        &mut self,
+        graph: &SeaOfNodes,
+        test: usize,
+        consequent: usize,
+        alternate: usize,
+    ) -> Option<()> {
+        let base_depth = self.stack_depth;
+        graph.emit_node(test, self)?;
+        self.code.extend_from_slice(&[
+            0xF2, 0x0F, 0x10, 0x04, 0x24, // movsd xmm0, [rsp]
+            0x48, 0x83, 0xC4, 0x08, // add rsp, 8
+            0x0F, 0x57, 0xC9, // xorps xmm1, xmm1
+            0x66, 0x0F, 0x2E, 0xC1, // ucomisd xmm0, xmm1
+            0x0F, 0x85, // jne consequent
+        ]);
+        self.stack_depth -= 1;
+        let consequent_jump = self.emit_rel32_placeholder();
+
+        graph.emit_node(alternate, self)?;
+        if self.stack_depth != base_depth + 1 {
+            return None;
+        }
+        self.code.push(0xE9); // jmp end
+        let end_jump = self.emit_rel32_placeholder();
+
+        self.patch_rel32(consequent_jump, self.code.len())?;
+        self.stack_depth = base_depth;
+        graph.emit_node(consequent, self)?;
+        if self.stack_depth != base_depth + 1 {
+            return None;
+        }
+        self.patch_rel32(end_jump, self.code.len())?;
+        Some(())
+    }
+
+    fn emit_rel32_placeholder(&mut self) -> usize {
+        let operand = self.code.len();
+        self.code.extend_from_slice(&[0; 4]);
+        operand
+    }
+
+    fn patch_rel32(&mut self, operand: usize, target: usize) -> Option<()> {
+        let displacement = i32::try_from(target.checked_sub(operand.checked_add(4)?)?).ok()?;
+        self.code[operand..operand + 4].copy_from_slice(&displacement.to_le_bytes());
+        Some(())
+    }
+
     fn emit_operation(
         &mut self,
         graph: &SeaOfNodes,

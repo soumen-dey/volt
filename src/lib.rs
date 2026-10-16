@@ -25,6 +25,7 @@ enum FunctionTier {
     Interpreted,
     Bytecode,
     BaselineJit,
+    OptimizingJit,
 }
 
 #[derive(Default)]
@@ -34,8 +35,8 @@ struct FunctionProfile {
     loop_backedges: u64,
     numeric_operations: u64,
     generic_operations: u64,
-    baseline_jit_executions: u64,
-    baseline_jit_deoptimizations: u64,
+    native_jit_executions: u64,
+    native_jit_deoptimizations: u64,
     left_types: u8,
     right_types: u8,
     tier: FunctionTier,
@@ -1794,7 +1795,7 @@ impl Engine {
         function: ObjectId,
         body: &[Stmt],
         scope: ScopeId,
-    ) -> Option<f64> {
+    ) -> Option<(f64, jit::FunctionJitTier)> {
         let [Stmt::Return(Some(expression))] = body else {
             return None;
         };
@@ -1815,7 +1816,8 @@ impl Engine {
             };
             inputs.push(value);
         }
-        Some(self.function_jit.get(&function)?.run(&inputs))
+        let compiled = self.function_jit.get(&function)?;
+        Some((compiled.run(&inputs), compiled.tier()))
     }
 
     fn instantiate_declarations(
@@ -3421,14 +3423,16 @@ impl Engine {
                 } else {
                     None
                 };
-                let result = if let Some(value) = native_result {
+                let result = if let Some((value, tier)) = native_result {
                     let profile = self
                         .function_profiles
                         .get_mut(&id)
                         .expect("function profile was initialized");
-                    profile.tier = FunctionTier::BaselineJit;
-                    profile.baseline_jit_executions =
-                        profile.baseline_jit_executions.saturating_add(1);
+                    profile.tier = match tier {
+                        jit::FunctionJitTier::Baseline => FunctionTier::BaselineJit,
+                        jit::FunctionJitTier::Optimizing => FunctionTier::OptimizingJit,
+                    };
+                    profile.native_jit_executions = profile.native_jit_executions.saturating_add(1);
                     Ok(Completion::Return(Value::Number(value)))
                 } else {
                     if use_bytecode && self.function_jit.contains_key(&id) {
@@ -3436,8 +3440,8 @@ impl Engine {
                             .function_profiles
                             .get_mut(&id)
                             .expect("function profile was initialized");
-                        profile.baseline_jit_deoptimizations =
-                            profile.baseline_jit_deoptimizations.saturating_add(1);
+                        profile.native_jit_deoptimizations =
+                            profile.native_jit_deoptimizations.saturating_add(1);
                     }
                     if use_bytecode
                         && let Some(mut bytecode) = vm::Bytecode::compile_function(&body)
@@ -7910,23 +7914,20 @@ mod tests {
         let profile = &engine.function_profiles[&function];
         assert_eq!(profile.invocations, 3);
         assert_eq!(profile.tier, FunctionTier::BaselineJit);
-        assert_eq!(profile.baseline_jit_executions, 1);
+        assert_eq!(profile.native_jit_executions, 1);
 
         assert_eq!(
             engine.eval("tierProfileProbe(10)").unwrap(),
             Value::Number(11.0)
         );
-        assert_eq!(
-            engine.function_profiles[&function].baseline_jit_executions,
-            2
-        );
+        assert_eq!(engine.function_profiles[&function].native_jit_executions, 2);
 
         assert_eq!(
             engine.eval("tierProfileProbe('text')").unwrap(),
             Value::String("text1".to_owned())
         );
         let profile = &engine.function_profiles[&function];
-        assert_eq!(profile.baseline_jit_deoptimizations, 1);
+        assert_eq!(profile.native_jit_deoptimizations, 1);
         assert_eq!(profile.generic_operations, 1);
         assert_ne!(profile.left_types & (1 << 4), 0);
         assert_ne!(profile.right_types & (1 << 3), 0);
@@ -8008,7 +8009,7 @@ mod tests {
             FunctionTier::Bytecode
         );
         assert_eq!(
-            engine.function_profiles[&function].baseline_jit_deoptimizations,
+            engine.function_profiles[&function].native_jit_deoptimizations,
             1
         );
     }
@@ -8023,6 +8024,53 @@ mod tests {
                 )
                 .unwrap(),
             Value::Number(11.0)
+        );
+    }
+
+    #[test]
+    fn baseline_jit_compiles_numeric_conditional_control_flow() {
+        let mut engine = Engine::new();
+        engine
+            .eval("function tierBranchProbe(value) { return value ? value + 2 : 7; }")
+            .unwrap();
+        let Value::Object(function) =
+            &engine.scopes[engine.global].bindings["tierBranchProbe"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        let function = *function;
+
+        assert_eq!(
+            engine.eval("tierBranchProbe(3)").unwrap(),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            engine.eval("tierBranchProbe(0)").unwrap(),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            engine.eval("tierBranchProbe(-4)").unwrap(),
+            Value::Number(-2.0)
+        );
+        assert_eq!(
+            engine.function_profiles[&function].tier,
+            FunctionTier::OptimizingJit
+        );
+        assert_eq!(
+            engine.eval("tierBranchProbe('5')").unwrap(),
+            Value::String("52".to_owned())
+        );
+        assert_eq!(
+            engine.function_profiles[&function].native_jit_deoptimizations,
+            1
+        );
+        assert_eq!(
+            engine.eval("tierBranchProbe(0 / 0)").unwrap(),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            engine.eval("tierBranchProbe(1)").unwrap(),
+            Value::Number(3.0)
         );
     }
 
