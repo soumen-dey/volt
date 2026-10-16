@@ -159,16 +159,16 @@ pub(crate) struct Program {
     pub strict: bool,
 }
 
-pub(crate) struct Parser {
-    tokens: Vec<Token>,
+pub(crate) struct Parser<'source> {
+    tokens: Vec<Token<'source>>,
     current: usize,
     function_depth: usize,
     loop_depth: usize,
     strict_context: bool,
 }
 
-impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+impl<'source> Parser<'source> {
+    pub fn new(tokens: Vec<Token<'source>>) -> Self {
         Self {
             tokens,
             current: 0,
@@ -291,10 +291,10 @@ impl Parser {
         consume_terminator: bool,
         allow_missing_const_initializer: bool,
     ) -> Result<Stmt, EngineError> {
-        let keyword = self.previous().clone();
+        let keyword = (*self.previous()).clone();
         let kind = match &keyword.kind {
-            TokenKind::Identifier(name) if name == "const" => DeclarationKind::Const,
-            TokenKind::Identifier(name) if name == "var" => DeclarationKind::Var,
+            TokenKind::Identifier(name) if *name == "const" => DeclarationKind::Const,
+            TokenKind::Identifier(name) if *name == "var" => DeclarationKind::Var,
             _ => DeclarationKind::Let,
         };
         let (name, line, column) = self.consume_binding_identifier("Expected a binding name")?;
@@ -361,7 +361,7 @@ impl Parser {
             if self.matches_keyword("of") || self.matches_keyword("in") {
                 let is_of = matches!(
                     &self.previous().kind,
-                    TokenKind::Identifier(operator) if operator == "of"
+                    TokenKind::Identifier(operator) if *operator == "of"
                 );
                 let (name, kind) = match declaration {
                     Stmt::Declaration {
@@ -570,7 +570,7 @@ impl Parser {
     fn assignment(&mut self) -> Result<Expr, EngineError> {
         let expression = self.conditional()?;
         let operator = match &self.peek().kind {
-            TokenKind::Operator(operator) => match operator.as_str() {
+            TokenKind::Operator(operator) => match *operator {
                 "=" => Some(None),
                 "+=" => Some(Some(BinaryOp::Add)),
                 "-=" => Some(Some(BinaryOp::Subtract)),
@@ -593,7 +593,7 @@ impl Parser {
         };
         if let Some(operator) = operator {
             self.advance();
-            let equals = self.previous().clone();
+            let equals = (*self.previous()).clone();
             let value = self.assignment()?;
             if matches!(
                 expression,
@@ -650,7 +650,7 @@ impl Parser {
 
     fn unary(&mut self) -> Result<Expr, EngineError> {
         if let TokenKind::Operator(operator) = &self.peek().kind {
-            let unary = match operator.as_str() {
+            let unary = match *operator {
                 "!" => Some(UnaryOp::Not),
                 "+" => Some(UnaryOp::Plus),
                 "-" => Some(UnaryOp::Minus),
@@ -658,7 +658,8 @@ impl Parser {
                 _ => None,
             };
             if let Some(operator) = unary {
-                let token = self.advance().clone();
+                self.advance();
+                let token = (*self.previous()).clone();
                 return Ok(Expr::Unary {
                     operator,
                     operand: Box::new(self.unary()?),
@@ -670,7 +671,7 @@ impl Parser {
         if self.matches_operator("++") || self.matches_operator("--") {
             let increment = matches!(
                 &self.previous().kind,
-                TokenKind::Operator(operator) if operator == "++"
+                TokenKind::Operator(operator) if *operator == "++"
             );
             let target = self.unary()?;
             if !matches!(
@@ -689,10 +690,10 @@ impl Parser {
             || self.matches_keyword("void")
             || self.matches_keyword("delete")
         {
-            let token = self.previous().clone();
+            let token = (*self.previous()).clone();
             let operator = match &token.kind {
-                TokenKind::Identifier(name) if name == "typeof" => UnaryOp::TypeOf,
-                TokenKind::Identifier(name) if name == "void" => UnaryOp::Void,
+                TokenKind::Identifier(name) if *name == "typeof" => UnaryOp::TypeOf,
+                TokenKind::Identifier(name) if *name == "void" => UnaryOp::Void,
                 _ => UnaryOp::Delete,
             };
             return Ok(Expr::Unary {
@@ -733,7 +734,7 @@ impl Parser {
             } else if self.matches_operator("++") || self.matches_operator("--") {
                 let increment = matches!(
                     &self.previous().kind,
-                    TokenKind::Operator(operator) if operator == "++"
+                    TokenKind::Operator(operator) if *operator == "++"
                 );
                 if self.peek().line > self.previous().line {
                     self.current -= 1;
@@ -804,23 +805,18 @@ impl Parser {
         if self.matches(&TokenKind::LeftBracket) {
             return self.array_literal();
         }
-        let token = self.advance().clone();
+        self.advance();
+        let token = (*self.previous()).clone();
         match token.kind {
             TokenKind::Number(value) => Ok(Expr::Literal(Value::Number(value))),
             TokenKind::String(value) => Ok(Expr::Literal(Value::String(value))),
-            TokenKind::Identifier(name) if name == "true" => {
-                Ok(Expr::Literal(Value::Boolean(true)))
-            }
-            TokenKind::Identifier(name) if name == "false" => {
-                Ok(Expr::Literal(Value::Boolean(false)))
-            }
-            TokenKind::Identifier(name) if name == "null" => Ok(Expr::Literal(Value::Null)),
-            TokenKind::Identifier(name) if name == "undefined" => {
-                Ok(Expr::Literal(Value::Undefined))
-            }
-            TokenKind::Identifier(name) if name == "this" => Ok(Expr::This),
+            TokenKind::Identifier("true") => Ok(Expr::Literal(Value::Boolean(true))),
+            TokenKind::Identifier("false") => Ok(Expr::Literal(Value::Boolean(false))),
+            TokenKind::Identifier("null") => Ok(Expr::Literal(Value::Null)),
+            TokenKind::Identifier("undefined") => Ok(Expr::Literal(Value::Undefined)),
+            TokenKind::Identifier("this") => Ok(Expr::This),
             TokenKind::Identifier(name) => Ok(Expr::Identifier {
-                name,
+                name: name.to_owned(),
                 line: token.line,
                 column: token.column,
             }),
@@ -836,9 +832,14 @@ impl Parser {
     fn object_literal(&mut self) -> Result<Expr, EngineError> {
         let mut properties = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
-            let key = match self.advance().clone() {
+            self.advance();
+            let key = match self.previous().clone() {
                 Token {
-                    kind: TokenKind::Identifier(key) | TokenKind::String(key),
+                    kind: TokenKind::Identifier(key),
+                    ..
+                } => key.to_owned(),
+                Token {
+                    kind: TokenKind::String(key),
                     ..
                 } => key,
                 Token {
@@ -875,10 +876,10 @@ impl Parser {
 
     fn current_binary_operator(&self) -> Option<(BinaryOp, u8)> {
         let operator = match &self.peek().kind {
-            TokenKind::Operator(operator) | TokenKind::Identifier(operator) => operator,
+            TokenKind::Operator(operator) | TokenKind::Identifier(operator) => *operator,
             _ => return None,
         };
-        Some(match operator.as_str() {
+        Some(match operator {
             "??" => (BinaryOp::Nullish, 1),
             "||" => (BinaryOp::Or, 2),
             "&&" => (BinaryOp::And, 3),
@@ -910,9 +911,11 @@ impl Parser {
 
     fn consume_identifier(&mut self, message: &str) -> Result<(String, usize, usize), EngineError> {
         if let TokenKind::Identifier(name) = &self.peek().kind {
-            let name = name.clone();
-            let token = self.advance();
-            return Ok((name, token.line, token.column));
+            let name = (*name).to_owned();
+            let line = self.peek().line;
+            let column = self.peek().column;
+            self.advance();
+            return Ok((name, line, column));
         }
         Err(self.error_here(message))
     }
@@ -996,7 +999,7 @@ impl Parser {
     }
 
     fn matches_keyword(&mut self, keyword: &str) -> bool {
-        if matches!(&self.peek().kind, TokenKind::Identifier(name) if name == keyword) {
+        if matches!(&self.peek().kind, TokenKind::Identifier(name) if *name == keyword) {
             self.advance();
             true
         } else {
@@ -1005,7 +1008,7 @@ impl Parser {
     }
 
     fn matches_operator(&mut self, operator: &str) -> bool {
-        if matches!(&self.peek().kind, TokenKind::Operator(value) if value == operator) {
+        if matches!(&self.peek().kind, TokenKind::Operator(value) if *value == operator) {
             self.advance();
             true
         } else {
@@ -1013,7 +1016,7 @@ impl Parser {
         }
     }
 
-    fn matches(&mut self, kind: &TokenKind) -> bool {
+    fn matches(&mut self, kind: &TokenKind<'source>) -> bool {
         if self.check(kind) {
             self.advance();
             true
@@ -1022,7 +1025,7 @@ impl Parser {
         }
     }
 
-    fn check(&self, kind: &TokenKind) -> bool {
+    fn check(&self, kind: &TokenKind<'source>) -> bool {
         std::mem::discriminant(&self.peek().kind) == std::mem::discriminant(kind)
     }
 
@@ -1030,18 +1033,17 @@ impl Parser {
         matches!(self.peek().kind, TokenKind::Eof)
     }
 
-    fn advance(&mut self) -> &Token {
+    fn advance(&mut self) {
         if !self.is_at_end() {
             self.current += 1;
         }
-        self.previous()
     }
 
-    fn peek(&self) -> &Token {
+    fn peek(&self) -> &Token<'source> {
         &self.tokens[self.current]
     }
 
-    fn previous(&self) -> &Token {
+    fn previous(&self) -> &Token<'source> {
         &self.tokens[self.current.saturating_sub(1)]
     }
 
@@ -1049,7 +1051,7 @@ impl Parser {
         self.error_at(self.peek(), message)
     }
 
-    fn error_at(&self, token: &Token, message: &str) -> EngineError {
+    fn error_at(&self, token: &Token<'source>, message: &str) -> EngineError {
         EngineError::new("SyntaxError", message, token.line, token.column)
     }
 }

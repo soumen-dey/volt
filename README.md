@@ -57,6 +57,10 @@ The interpreter currently supports:
   `EvalError`, `RangeError`, `ReferenceError`, `SyntaxError`, `TypeError`,
   and `URIError` objects
 - line and block comments
+- AVX2-accelerated x86 and NEON-accelerated AArch64 scanning of ASCII
+  identifier runs and horizontal whitespace, with a portable scalar fallback;
+  identifier and operator token text borrows the source instead of allocating
+  per token
 - a persistent global environment across evaluations
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
@@ -77,6 +81,8 @@ grammar is not implemented.
 `WeakMap` and `WeakSet` enforce object-key requirements but do not provide
 garbage-collection weak-reference behavior because the runtime has no garbage
 collector.
+SIMD scanning currently accelerates ASCII identifier runs and spaces/tabs;
+string decoding, token storage, and AST construction still allocate.
 Some array methods,
 complete string/number behavior, RegExp literal parsing and the complete set of
 RegExp/String integration algorithms and edge cases, `Symbol`, `BigInt`, `Proxy`,
