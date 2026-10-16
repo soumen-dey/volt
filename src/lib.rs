@@ -24,6 +24,7 @@ enum FunctionTier {
     #[default]
     Interpreted,
     Bytecode,
+    BaselineJit,
 }
 
 #[derive(Default)]
@@ -33,6 +34,8 @@ struct FunctionProfile {
     loop_backedges: u64,
     numeric_operations: u64,
     generic_operations: u64,
+    baseline_jit_executions: u64,
+    baseline_jit_deoptimizations: u64,
     left_types: u8,
     right_types: u8,
     tier: FunctionTier,
@@ -363,6 +366,7 @@ pub struct Engine {
     bytecode_cache: Vec<HashMap<usize, vm::Bytecode>>,
     jit_cache: Vec<jit::JitCache>,
     function_profiles: HashMap<ObjectId, FunctionProfile>,
+    function_jit: HashMap<ObjectId, jit::FunctionJit>,
     active_function_stack: Vec<ObjectId>,
 }
 
@@ -401,6 +405,7 @@ impl Engine {
             bytecode_cache: Vec::new(),
             jit_cache: Vec::new(),
             function_profiles: HashMap::new(),
+            function_jit: HashMap::new(),
             active_function_stack: Vec::new(),
             random_state: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1169,6 +1174,7 @@ impl Engine {
         };
         let id = if let Some(id) = self.free_objects.pop() {
             self.function_profiles.remove(&id);
+            self.function_jit.remove(&id);
             self.objects[id] = object;
             self.object_ages[id] = 0;
             self.object_live[id] = true;
@@ -1270,6 +1276,7 @@ impl Engine {
                 self.object_ages[id] = 0;
                 self.object_live[id] = false;
                 self.function_profiles.remove(&id);
+                self.function_jit.remove(&id);
                 self.free_objects.push(id);
                 reclaimed += 1;
             } else if self.object_live[id] && is_marked && self.object_ages[id] == 0 {
@@ -1780,6 +1787,35 @@ impl Engine {
             let profile = self.function_profiles.entry(function).or_default();
             profile.loop_iterations = profile.loop_iterations.saturating_add(1);
         }
+    }
+
+    fn run_function_jit(
+        &mut self,
+        function: ObjectId,
+        body: &[Stmt],
+        scope: ScopeId,
+    ) -> Option<f64> {
+        let [Stmt::Return(Some(expression))] = body else {
+            return None;
+        };
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.function_jit.entry(function) {
+            let compiled = jit::FunctionJit::compile(expression)?;
+            slot.insert(compiled);
+        }
+        let variables = self.function_jit.get(&function)?.variables().to_vec();
+        let mut inputs = Vec::with_capacity(variables.len());
+        for name in variables {
+            let binding_scope = self.find_binding_scope(scope, &name)?;
+            if binding_scope == self.global {
+                return None;
+            }
+            let value = self.get_binding(scope, &name, 1, 1).ok()??;
+            let Value::Number(value) = value else {
+                return None;
+            };
+            inputs.push(value);
+        }
+        Some(self.function_jit.get(&function)?.run(&inputs))
     }
 
     fn instantiate_declarations(
@@ -3380,7 +3416,29 @@ impl Engine {
                     profile.is_hot()
                 };
                 self.active_function_stack.push(id);
-                let result =
+                let native_result = if use_bytecode {
+                    self.run_function_jit(id, &body, function_scope)
+                } else {
+                    None
+                };
+                let result = if let Some(value) = native_result {
+                    let profile = self
+                        .function_profiles
+                        .get_mut(&id)
+                        .expect("function profile was initialized");
+                    profile.tier = FunctionTier::BaselineJit;
+                    profile.baseline_jit_executions =
+                        profile.baseline_jit_executions.saturating_add(1);
+                    Ok(Completion::Return(Value::Number(value)))
+                } else {
+                    if use_bytecode && self.function_jit.contains_key(&id) {
+                        let profile = self
+                            .function_profiles
+                            .get_mut(&id)
+                            .expect("function profile was initialized");
+                        profile.baseline_jit_deoptimizations =
+                            profile.baseline_jit_deoptimizations.saturating_add(1);
+                    }
                     if use_bytecode
                         && let Some(mut bytecode) = vm::Bytecode::compile_function(&body)
                     {
@@ -3403,7 +3461,8 @@ impl Engine {
                         }
                     } else {
                         self.execute_statements(&body, function_scope)
-                    };
+                    }
+                };
                 self.active_function_stack.pop();
                 self.jit_cache.pop();
                 self.bytecode_cache.pop();
@@ -7850,15 +7909,24 @@ mod tests {
         );
         let profile = &engine.function_profiles[&function];
         assert_eq!(profile.invocations, 3);
-        assert_eq!(profile.tier, FunctionTier::Bytecode);
-        assert_eq!(profile.numeric_operations, 1);
-        assert_ne!(profile.left_types & (1 << 3), 0);
+        assert_eq!(profile.tier, FunctionTier::BaselineJit);
+        assert_eq!(profile.baseline_jit_executions, 1);
+
+        assert_eq!(
+            engine.eval("tierProfileProbe(10)").unwrap(),
+            Value::Number(11.0)
+        );
+        assert_eq!(
+            engine.function_profiles[&function].baseline_jit_executions,
+            2
+        );
 
         assert_eq!(
             engine.eval("tierProfileProbe('text')").unwrap(),
             Value::String("text1".to_owned())
         );
         let profile = &engine.function_profiles[&function];
+        assert_eq!(profile.baseline_jit_deoptimizations, 1);
         assert_eq!(profile.generic_operations, 1);
         assert_ne!(profile.left_types & (1 << 4), 0);
         assert_ne!(profile.right_types & (1 << 3), 0);
@@ -7911,6 +7979,50 @@ mod tests {
         assert_eq!(
             engine.function_profiles[&function].tier,
             FunctionTier::Interpreted
+        );
+    }
+
+    #[test]
+    fn baseline_jit_falls_back_for_global_bindings() {
+        let mut engine = Engine::new();
+        engine
+            .eval(
+                "let tierGlobalValue = 8; function tierGlobalProbe() { return tierGlobalValue + 1; }",
+            )
+            .unwrap();
+        let Value::Object(function) =
+            &engine.scopes[engine.global].bindings["tierGlobalProbe"].value
+        else {
+            panic!("function declaration should create an object");
+        };
+        let function = *function;
+
+        for _ in 0..FUNCTION_TIER_THRESHOLD {
+            assert_eq!(
+                engine.eval("tierGlobalProbe()").unwrap(),
+                Value::Number(9.0)
+            );
+        }
+        assert_eq!(
+            engine.function_profiles[&function].tier,
+            FunctionTier::Bytecode
+        );
+        assert_eq!(
+            engine.function_profiles[&function].baseline_jit_deoptimizations,
+            1
+        );
+    }
+
+    #[test]
+    fn baseline_jit_reads_current_numeric_closure_values() {
+        let mut engine = Engine::new();
+        assert_eq!(
+            engine
+                .eval(
+                    "function makeTierJitPair() { let value = 2; return { run: function() { return value + 1; }, set: function(next) { value = next; } }; } let tierJitPair = makeTierJitPair(); tierJitPair.run(); tierJitPair.run(); tierJitPair.run(); tierJitPair.set(10); tierJitPair.run()",
+                )
+                .unwrap(),
+            Value::Number(11.0)
         );
     }
 

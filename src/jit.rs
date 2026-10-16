@@ -9,6 +9,29 @@ pub(crate) struct JitCache {
     entries: HashMap<usize, Entry>,
 }
 
+pub(crate) struct FunctionJit {
+    variables: Vec<String>,
+    baseline: NativeCode,
+}
+
+impl FunctionJit {
+    pub(crate) fn compile(expression: &Expr) -> Option<Self> {
+        let (code, variables) = BaselineCompiler::compile(expression)?;
+        Some(Self {
+            variables,
+            baseline: NativeCode::compile(&code)?,
+        })
+    }
+
+    pub(crate) fn variables(&self) -> &[String] {
+        &self.variables
+    }
+
+    pub(crate) fn run(&self, inputs: &[f64]) -> f64 {
+        self.baseline.call(inputs)
+    }
+}
+
 struct Entry {
     executions: u32,
     variables: Vec<String>,
