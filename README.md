@@ -82,6 +82,8 @@ The interpreter currently supports:
   collection cleanup, automatic minor collections, and an explicit full
   collection API
 - a persistent global environment across evaluations
+- optional per-evaluation instruction and user-function call-depth limits for
+  embedders; these are resource guards, not a security sandbox
 - statement termination with semicolons, line breaks, closing braces, or EOF
 
 The built-ins are a focused subset, not the full ECMAScript standard library.
@@ -167,11 +169,13 @@ cargo bench --bench runtime
 
 It prints CSV-style elapsed time per operation for end-to-end arithmetic
 evaluation (including lexing/parsing), warmed native counted-sum calls,
-constant-loop unrolling, and full-collection pauses (median and p95 over 40
-samples). The harness reports target OS/architecture but does not control CPU
-frequency, thermal state, background load, or allocator state. Record the
-Rust compiler version and CPU model when comparing runs. Measurements are
-diagnostic, not portable performance claims.
+constant-loop unrolling, and full-collection pauses (median and p95). Timed
+benchmarks use nine samples after a fixed warmup; GC pause statistics use 40
+fresh-engine samples. Output includes the Rust compiler version, target OS,
+architecture, and Windows CPU identifier when available. The harness does not
+control CPU frequency, thermal state, background load, or allocator state.
+It does not compare against other engines. Measurements are diagnostic, not
+portable performance claims.
 Unsupported syntax reports a `SyntaxError`. Object and scope storage is
 engine-owned and reclaimed when the engine is dropped; long-running scripts
 can still retain reachable objects, and execution time, memory, and recursion
@@ -220,7 +224,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `Engine::eval` returns the interpreter's `Value`; `Engine::eval_to_string`
 formats that value for the CLI and simple embedding use. The `Value` type and
-`EngineError` are public.
+`EngineError` are public. Hosts can opt into per-evaluation instruction and
+user-function call-depth limits:
+
+```rust
+use volt_engine::{Engine, EngineLimits};
+use std::time::Duration;
+
+let mut engine = Engine::with_limits(EngineLimits {
+    max_source_bytes: 1_000_000,
+    max_execution_steps: 100_000,
+    max_call_depth: 128,
+    max_evaluation_time: Duration::from_millis(100),
+});
+```
+
+The source-byte cap is checked before tokenization and parsing. The execution
+budget is charged by interpreter operations and each VM instruction; it resets
+for every top-level `eval` call. Native JIT execution is bypassed when limits
+are active so it cannot evade the step budget. These limits do not bound heap
+memory or make Volt a security sandbox. The time budget is cooperative: checks
+occur between runtime operations and do not interrupt parsing, a native/library
+operation, or a running host callback. It is not a hard wall-clock timeout. Do
+not use the engine to execute untrusted scripts.
+
+Rust hosts can expose callbacks as JavaScript global functions:
+
+```rust
+engine.register_fn("double", |arguments| match arguments.first() {
+    Some(volt_engine::Value::Number(value)) => {
+        Ok(volt_engine::Value::Number(value * 2.0))
+    }
+    _ => Err("double expects a number".to_owned()),
+})?;
+```
+
+Callback errors become JavaScript-visible `HostError`s. This callback
+interface cannot re-enter the engine.
+
+The C ABI is available from `include/volt.h` and the `cdylib` target. It
+provides engine creation/destruction, evaluation to a returned string, error
+retrieval, numeric-only host callback registration, and optional
+source/step/call-depth/cooperative-time budgets. C callbacks must not unwind,
+re-enter the engine, or retain argument pointers. A header-only C++ RAII
+wrapper is available in `include/volt.hpp`; a Python `ctypes` package is in
+`bindings/python`. Both require the platform-specific Volt shared library.
+Build that library with `cargo build --release`. Install the Python package
+from the repository root with `python -m pip install ./bindings/python`; when
+using it outside the checkout, set `VOLT_ENGINE_LIBRARY` to the built shared
+library path. For C++, include `include/volt.hpp` and link against the
+`volt_engine` shared library. A runnable example is in
+`examples/embed_cpp.cpp`. With the MSVC x64 tools available (for example,
+from a Visual Studio Developer PowerShell), build and run it from the
+repository root:
+
+```powershell
+cargo build --release
+cl /nologo /std:c++17 /EHsc /I include examples\embed_cpp.cpp /Fe:target\release\volt-cpp-example.exe /link target\release\volt_engine.dll.lib
+target\release\volt-cpp-example.exe
+```
+
+Go bindings are not included.
 
 ## Roadmap and conformance
 
@@ -230,8 +294,11 @@ The intended sequence is to grow the own implementation incrementally:
    constructor, and exception semantics.
 2. Add arrays and the standard built-ins systematically.
 3. Implement promise jobs and modules.
-4. Add concurrent marking, bounded pause-time strategies, and safe
-   embedding/resource controls to the initial stop-the-world collector.
+4. Add concurrent marking, bounded pause-time strategies, hard heap-memory and
+   wall-clock controls, and a complete sandboxing design to the initial
+   stop-the-world collector. Configurable execution-step and user-function
+   call-depth guards and a source-size cap exist, but do not make untrusted
+   execution safe.
 5. Make the Test262 harness work with the owned runtime and measure progress
    against a pinned suite revision; only then expand toward ES2020.
 

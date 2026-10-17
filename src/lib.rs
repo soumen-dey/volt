@@ -1,3 +1,4 @@
+mod ffi;
 mod jit;
 mod lexer;
 mod parser;
@@ -8,7 +9,8 @@ use parser::{BinaryOp, DeclarationKind, Expr, Stmt, UnaryOp};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
-    time::{SystemTime, UNIX_EPOCH},
+    rc::Rc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 type ObjectId = usize;
@@ -150,6 +152,20 @@ pub struct EngineError {
     pub thrown: Option<Value>,
 }
 
+/// Optional execution limits for hosts that need a bounded evaluation budget.
+///
+/// These limits do not provide a security sandbox or a hard memory cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineLimits {
+    pub max_source_bytes: usize,
+    pub max_execution_steps: usize,
+    pub max_call_depth: usize,
+    pub max_evaluation_time: Duration,
+}
+
+pub type CNumberCallback =
+    unsafe extern "C" fn(*mut std::ffi::c_void, *const f64, usize, *mut f64) -> i32;
+
 impl EngineError {
     fn new(name: &'static str, message: impl Into<String>, line: usize, column: usize) -> Self {
         Self {
@@ -229,6 +245,7 @@ enum NativeFunction {
     PrimitiveMethod(&'static str),
     Math(&'static str),
     Json(&'static str),
+    Host(usize),
 }
 
 #[derive(Clone)]
@@ -240,6 +257,16 @@ enum Function {
         strict: bool,
     },
     Native(NativeFunction),
+}
+
+type RustHostCallback = Rc<dyn Fn(&[Value]) -> Result<Value, String>>;
+#[derive(Clone)]
+enum HostCallback {
+    Rust(RustHostCallback),
+    CNumber {
+        callback: CNumberCallback,
+        user_data: *mut std::ffi::c_void,
+    },
 }
 
 #[derive(Default)]
@@ -369,6 +396,10 @@ pub struct Engine {
     function_profiles: HashMap<ObjectId, FunctionProfile>,
     function_jit: HashMap<ObjectId, jit::FunctionJit>,
     active_function_stack: Vec<ObjectId>,
+    host_functions: Vec<HostCallback>,
+    limits: Option<EngineLimits>,
+    remaining_execution_steps: Option<usize>,
+    evaluation_deadline: Option<Instant>,
 }
 
 impl Engine {
@@ -408,6 +439,10 @@ impl Engine {
             function_profiles: HashMap::new(),
             function_jit: HashMap::new(),
             active_function_stack: Vec::new(),
+            host_functions: Vec::new(),
+            limits: None,
+            remaining_execution_steps: None,
+            evaluation_deadline: None,
             random_state: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_nanos() as u64)
@@ -533,6 +568,141 @@ impl Engine {
         );
         engine.install_error_constructors();
         engine
+    }
+
+    /// Creates an engine that enforces per-evaluation step and function-call
+    /// depth limits. This is a resource guard, not a security sandbox.
+    pub fn with_limits(limits: EngineLimits) -> Self {
+        let mut engine = Self::new();
+        engine.limits = Some(limits);
+        engine
+    }
+
+    /// Registers a Rust callback as a JavaScript global function.
+    ///
+    /// The callback receives evaluated arguments and can return JavaScript
+    /// values or an error message that becomes a `HostError`. It cannot
+    /// re-enter or mutate the engine through this API.
+    pub fn register_fn<F>(&mut self, name: &str, function: F) -> Result<(), EngineError>
+    where
+        F: Fn(&[Value]) -> Result<Value, String> + 'static,
+    {
+        if name.is_empty() {
+            return Err(EngineError::new(
+                "TypeError",
+                "Host function name cannot be empty",
+                1,
+                1,
+            ));
+        }
+        if self.scopes[self.global].bindings.contains_key(name) {
+            return Err(EngineError::new(
+                "SyntaxError",
+                format!("Identifier '{name}' has already been declared"),
+                1,
+                1,
+            ));
+        }
+        let callback_index = self.host_functions.len();
+        self.host_functions
+            .push(HostCallback::Rust(Rc::new(function)));
+        let function_object = self.alloc_native(
+            NativeFunction::Host(callback_index),
+            Some(self.object_prototype),
+        );
+        self.set_property(function_object, "name", Value::String(name.to_owned()));
+        self.set_property(function_object, "length", Value::Number(0.0));
+        self.declare(
+            self.global,
+            name,
+            Value::Object(function_object),
+            false,
+            1,
+            1,
+        )?;
+        self.set_property(self.global_object, name, Value::Object(function_object));
+        Ok(())
+    }
+
+    /// Registers a C callback exposed to scripts as a global numeric function.
+    ///
+    /// Non-number arguments raise `TypeError`; a nonzero callback return code
+    /// raises `HostError`. The callback receives an argument array and writes
+    /// its numeric result through `out_result`.
+    ///
+    /// # Safety
+    /// The callback and user data must remain valid for as long as this engine
+    /// can call the registered function. The callback must not unwind across
+    /// the C ABI, re-enter this engine, or retain the argument/result pointers.
+    pub unsafe fn register_c_number_fn(
+        &mut self,
+        name: &str,
+        callback: CNumberCallback,
+        user_data: *mut std::ffi::c_void,
+    ) -> Result<(), EngineError> {
+        if name.is_empty() {
+            return Err(EngineError::new(
+                "TypeError",
+                "Host function name cannot be empty",
+                1,
+                1,
+            ));
+        }
+        if self.scopes[self.global].bindings.contains_key(name) {
+            return Err(EngineError::new(
+                "SyntaxError",
+                format!("Identifier '{name}' has already been declared"),
+                1,
+                1,
+            ));
+        }
+        let callback_index = self.host_functions.len();
+        self.host_functions.push(HostCallback::CNumber {
+            callback,
+            user_data,
+        });
+        let function_object = self.alloc_native(
+            NativeFunction::Host(callback_index),
+            Some(self.object_prototype),
+        );
+        self.set_property(function_object, "name", Value::String(name.to_owned()));
+        self.set_property(function_object, "length", Value::Number(0.0));
+        self.declare(
+            self.global,
+            name,
+            Value::Object(function_object),
+            false,
+            1,
+            1,
+        )?;
+        self.set_property(self.global_object, name, Value::Object(function_object));
+        Ok(())
+    }
+
+    fn tick_execution(&mut self) -> Result<(), EngineError> {
+        if self
+            .evaluation_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(EngineError::new(
+                "ExecutionLimitError",
+                "Cooperative evaluation time budget exceeded",
+                1,
+                1,
+            ));
+        }
+        if let Some(remaining) = &mut self.remaining_execution_steps {
+            if *remaining == 0 {
+                return Err(EngineError::new(
+                    "ExecutionLimitError",
+                    "Maximum execution step count exceeded",
+                    1,
+                    1,
+                ));
+            }
+            *remaining -= 1;
+        }
+        Ok(())
     }
 
     fn declare_global(&mut self, name: &str, value: Value, mutable: bool) {
@@ -1658,16 +1828,36 @@ impl Engine {
     }
 
     pub fn eval(&mut self, source: &str) -> Result<Value, EngineError> {
+        let evaluation_start = Instant::now();
+        self.evaluation_deadline = self
+            .limits
+            .and_then(|limits| evaluation_start.checked_add(limits.max_evaluation_time));
+        if self
+            .limits
+            .is_some_and(|limits| source.len() > limits.max_source_bytes)
+        {
+            self.evaluation_deadline = None;
+            return Err(EngineError::new(
+                "ExecutionLimitError",
+                "Maximum source byte length exceeded",
+                1,
+                1,
+            ));
+        }
         let tokens = Lexer::new(source).tokenize()?;
         let program = parser::Parser::new(tokens).parse_program()?;
+        self.tick_execution()?;
         self.bytecode_cache.push(HashMap::new());
         self.jit_cache.push(jit::JitCache::default());
+        self.remaining_execution_steps = self.limits.map(|limits| limits.max_execution_steps);
         let previous_strict = self.strict;
         self.strict = program.strict;
         let execution = self.execute_statements(&program.statements, self.global);
         self.jit_cache.pop();
         self.bytecode_cache.pop();
         self.strict = previous_strict;
+        self.remaining_execution_steps = None;
+        self.evaluation_deadline = None;
         let result = match execution {
             Err(error) => Err(error),
             Ok(Completion::Normal(value)) => Ok(value),
@@ -1797,6 +1987,9 @@ impl Engine {
         body: &[Stmt],
         scope: ScopeId,
     ) -> Option<(Value, jit::FunctionJitTier)> {
+        if self.limits.is_some() {
+            return None;
+        }
         if let std::collections::hash_map::Entry::Vacant(slot) = self.function_jit.entry(function) {
             let compiled = jit::FunctionJit::compile(parameters, body)?;
             slot.insert(compiled);
@@ -1911,6 +2104,7 @@ impl Engine {
         statement: &Stmt,
         scope: ScopeId,
     ) -> Result<Completion, EngineError> {
+        self.tick_execution()?;
         match statement {
             Stmt::Empty => Ok(Completion::Normal(Value::Undefined)),
             Stmt::Expression(expression) => {
@@ -2136,11 +2330,15 @@ impl Engine {
     }
 
     fn evaluate(&mut self, expression: &Expr, scope: ScopeId) -> Result<Value, EngineError> {
+        self.tick_execution()?;
         let expression_key = expression as *const Expr as usize;
-        let jit_variables = self
-            .jit_cache
-            .last_mut()
-            .and_then(|cache| cache.prepare(expression_key, expression));
+        let jit_variables = if self.limits.is_none() {
+            self.jit_cache
+                .last_mut()
+                .and_then(|cache| cache.prepare(expression_key, expression))
+        } else {
+            None
+        };
         if let Some(variables) = jit_variables {
             let mut inputs = Vec::with_capacity(variables.len());
             let mut is_numeric = true;
@@ -3346,6 +3544,17 @@ impl Engine {
                 closure,
                 strict,
             } => {
+                if self
+                    .limits
+                    .is_some_and(|limits| self.active_function_stack.len() >= limits.max_call_depth)
+                {
+                    return Err(EngineError::new(
+                        "ExecutionLimitError",
+                        "Maximum function call depth exceeded",
+                        1,
+                        1,
+                    ));
+                }
                 let function_scope = self.new_function_scope(closure);
                 let this_value = if strict {
                     this_value
@@ -3491,6 +3700,47 @@ impl Engine {
         arguments: Vec<Value>,
     ) -> Result<Value, EngineError> {
         match native {
+            NativeFunction::Host(index) => {
+                let callback = self.host_functions.get(index).cloned().ok_or_else(|| {
+                    EngineError::new("InternalError", "Host function is not registered", 1, 1)
+                })?;
+                match callback {
+                    HostCallback::Rust(callback) => callback(&arguments)
+                        .map_err(|message| EngineError::new("HostError", message, 1, 1)),
+                    HostCallback::CNumber {
+                        callback,
+                        user_data,
+                    } => {
+                        let numbers = arguments
+                            .iter()
+                            .map(|argument| match argument {
+                                Value::Number(value) => Ok(*value),
+                                _ => Err(EngineError::new(
+                                    "TypeError",
+                                    "C host callback accepts numeric arguments only",
+                                    1,
+                                    1,
+                                )),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let mut result = 0.0;
+                        // SAFETY: callback and user_data were registered through the
+                        // explicitly unsafe C ABI contract; the callback must not unwind.
+                        let status = unsafe {
+                            callback(user_data, numbers.as_ptr(), numbers.len(), &mut result)
+                        };
+                        if status != 0 {
+                            return Err(EngineError::new(
+                                "HostError",
+                                format!("C host callback returned status {status}"),
+                                1,
+                                1,
+                            ));
+                        }
+                        Ok(Value::Number(result))
+                    }
+                }
+            }
             NativeFunction::Object => match arguments.first() {
                 None | Some(Value::Undefined | Value::Null) => Ok(Value::Object(
                     self.alloc_object(Some(self.object_prototype)),
@@ -7542,6 +7792,10 @@ fn to_uint32(value: f64) -> u32 {
 }
 
 impl vm::Host for Engine {
+    fn tick_execution(&mut self) -> Result<(), EngineError> {
+        self.tick_execution()
+    }
+
     fn load_binding(
         &mut self,
         scope: usize,
@@ -7794,7 +8048,87 @@ fn collect_var_names(statements: &[Stmt], names: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, FUNCTION_TIER_THRESHOLD, FunctionTier, LOOP_TIER_THRESHOLD, Value};
+    use super::{
+        Engine, EngineLimits, FUNCTION_TIER_THRESHOLD, FunctionTier, LOOP_TIER_THRESHOLD, Value,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn configured_execution_limits_stop_bytecode_loops_and_reset_per_eval() {
+        let mut engine = Engine::with_limits(EngineLimits {
+            max_source_bytes: 1024,
+            max_execution_steps: 64,
+            max_call_depth: 16,
+            max_evaluation_time: Duration::from_secs(1),
+        });
+
+        let error = engine.eval("while (true) {}").unwrap_err();
+        assert_eq!(error.name, "ExecutionLimitError");
+        assert_eq!(
+            engine.eval_to_string("40 + 2").unwrap(),
+            "42",
+            "each top-level evaluation gets a fresh step budget"
+        );
+        assert_eq!(
+            engine.eval(&" ".repeat(1025)).unwrap_err().name,
+            "ExecutionLimitError",
+            "source-size guard runs before lexing and parsing"
+        );
+    }
+
+    #[test]
+    fn configured_call_depth_limit_stops_recursive_functions() {
+        let mut engine = Engine::with_limits(EngineLimits {
+            max_source_bytes: 10_000,
+            max_execution_steps: 10_000,
+            max_call_depth: 4,
+            max_evaluation_time: Duration::from_secs(1),
+        });
+        engine
+            .eval("function recurse() { return recurse(); }")
+            .unwrap();
+
+        let error = engine.eval("recurse()").unwrap_err();
+        assert_eq!(error.name, "ExecutionLimitError");
+        assert!(error.message.contains("call depth"));
+        assert_eq!(engine.eval_to_string("1 + 1").unwrap(), "2");
+    }
+
+    #[test]
+    fn configured_evaluation_time_budget_is_cooperative() {
+        let mut engine = Engine::with_limits(EngineLimits {
+            max_source_bytes: 1024,
+            max_execution_steps: 10_000,
+            max_call_depth: 16,
+            max_evaluation_time: Duration::ZERO,
+        });
+
+        let error = engine.eval("1 + 2").unwrap_err();
+        assert_eq!(error.name, "ExecutionLimitError");
+        assert!(error.message.contains("Cooperative"));
+    }
+
+    #[test]
+    fn rust_hosts_can_register_global_callbacks() {
+        let mut engine = Engine::new();
+        engine
+            .register_fn("hostDouble", |arguments| match arguments.first() {
+                Some(Value::Number(value)) => Ok(Value::Number(value * 2.0)),
+                _ => Err("hostDouble expects a numeric argument".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(engine.eval("hostDouble(21)").unwrap(), Value::Number(42.0));
+
+        let error = engine.eval("hostDouble('21')").unwrap_err();
+        assert_eq!(error.name, "HostError");
+        assert_eq!(
+            engine
+                .register_fn("hostDouble", |_| Ok(Value::Undefined))
+                .unwrap_err()
+                .name,
+            "SyntaxError"
+        );
+    }
 
     #[test]
     fn evaluates_precedence_and_persistent_bindings() {

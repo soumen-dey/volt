@@ -158,6 +158,7 @@ impl Bytecode {
         ];
 
         while frame.result.is_none() {
+            frame.host.tick_execution()?;
             let instruction = frame.read_word()?;
             let opcode = match instruction {
                 value if value == Opcode::LoadConstant as u16 => Opcode::LoadConstant,
@@ -609,6 +610,8 @@ fn value_type_mask(value: &Value) -> u8 {
 }
 
 pub(crate) trait Host {
+    fn tick_execution(&mut self) -> Result<(), EngineError>;
+
     fn load_binding(
         &mut self,
         scope: usize,

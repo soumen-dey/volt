@@ -10,6 +10,7 @@ regress = { version = "0.12", features = ["utf16"] }
 [lib]
 name = "volt_engine"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "volt"
